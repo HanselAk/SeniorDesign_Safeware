@@ -4,6 +4,9 @@ Library: mpu6050-raspberrypi (pip install mpu6050-raspberrypi)
 Algorithm: Threshold-based SMV (Signal Magnitude Vector)
 
 
+MPU6050Raspberry PiVCCPin 1 (3.3V)GNDPin 6 (GND)SDAPin 3 (GPIO 2)SCLPin 5 (GPIO 3)AD0GND
+
+
 Fall logic:
   1. SMV drops below FREE_FALL_THRESHOLD  -> free-fall phase detected
   2. Within IMPACT_WINDOW seconds, SMV spikes above IMPACT_THRESHOLD -> impact confirmed
