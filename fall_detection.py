@@ -2,7 +2,7 @@
 MPU6050 Fall Detection - Raspberry Pi
 Library: mpu6050-raspberrypi (pip install mpu6050-raspberrypi)
 Algorithm: Threshold-based SMV (Signal Magnitude Vector)
-No AI / No ML
+
 
 Fall logic:
   1. SMV drops below FREE_FALL_THRESHOLD  -> free-fall phase detected
