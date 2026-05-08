@@ -50,9 +50,9 @@ HR_ALERT_BPM      = 120       # BPM threshold for tachycardia alert
 HR_SAMPLE_WINDOW  = 10        # seconds of samples to average BPM over
 
 # --- GPS simulator config ---
-SIM_BASE_LAT      = 33.9526   # Marietta, GA
-SIM_BASE_LON      = -84.5499
-SIM_BASE_ALT      = 310.0     # meters
+SIM_BASE_LAT      = 33.93994
+SIM_BASE_LON      = -84.52011
+SIM_BASE_ALT      = 310.0
 SIM_SITE_RADIUS_M = 80        # keep worker within this radius
 SIM_WALK_SPEED    = 1.2       # m/s (walking pace)
 SIM_UPDATE_HZ     = 1.0       # GPS-style 1 Hz
