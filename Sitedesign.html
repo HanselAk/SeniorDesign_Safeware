@@ -1,0 +1,493 @@
+app = Flask(__name__)
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sensor Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;600;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:     #080c10;
+    --panel:  #0d1520;
+    --border: #1a2d44;
+    --accent: #00e5ff;
+    --green:  #39ff14;
+    --red:    #ff1744;
+    --yellow: #ffd600;
+    --orange: #ff6d00;
+    --text:   #c8d8e8;
+    --dim:    #445566;
+    --mono:   'Share Tech Mono', monospace;
+    --sans:   'Barlow', sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); min-height: 100vh; padding: 16px; }
+  body::before {
+    content: ''; position: fixed; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.06) 2px, rgba(0,0,0,0.06) 4px);
+    pointer-events: none; z-index: 999;
+  }
+  header { display:flex; align-items:center; gap:14px; margin-bottom:18px; border-bottom:1px solid var(--border); padding-bottom:12px; }
+  header .dot { width:10px; height:10px; border-radius:50%; background:var(--green); animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  header h1 { font-family:var(--sans); font-weight:800; font-size:1.1rem; letter-spacing:0.18em; text-transform:uppercase; color:var(--accent); }
+  header .sub { font-family:var(--mono); font-size:0.7rem; color:var(--dim); margin-left:auto; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr 320px;
+    grid-template-rows: auto auto auto;
+    gap: 12px;
+  }
+
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:16px; position:relative; overflow:hidden; }
+  .panel::after { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,var(--accent),transparent); }
+  .panel-label { font-family:var(--mono); font-size:0.65rem; letter-spacing:0.2em; color:var(--dim); text-transform:uppercase; margin-bottom:14px; }
+
+  /* IMU */
+  .axis-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .axis-label { font-family:var(--mono); font-size:0.75rem; color:var(--dim); width:22px; }
+  .axis-bar-wrap { flex:1; height:8px; background:#0a1520; border-radius:4px; overflow:hidden; }
+  .axis-bar { height:100%; border-radius:4px; transition:width 0.15s ease; }
+  .bar-x { background:var(--accent); } .bar-y { background:var(--green); } .bar-z { background:var(--yellow); }
+  .axis-val { font-family:var(--mono); font-size:0.8rem; width:64px; text-align:right; }
+  .smv-row { margin-top:14px; padding-top:10px; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+  .smv-label { font-family:var(--mono); font-size:0.65rem; color:var(--dim); }
+  .smv-val { font-family:var(--mono); font-size:1.2rem; color:var(--accent); }
+
+  /* Temperature */
+  .temp-main { display:flex; align-items:baseline; gap:10px; margin-bottom:4px; }
+  .temp-big { font-family:var(--mono); font-size:2.6rem; font-weight:700; line-height:1; transition: color 0.4s; }
+  .temp-unit { font-family:var(--mono); font-size:1rem; color:var(--dim); }
+  .temp-sub { font-family:var(--mono); font-size:0.75rem; color:var(--dim); margin-bottom:12px; }
+  .temp-bar-wrap { width:100%; height:10px; background:#0a1520; border-radius:5px; overflow:hidden; margin-bottom:5px; }
+  .temp-bar { height:100%; border-radius:5px; transition: width 0.4s ease, background 0.4s ease; }
+  .temp-range { display:flex; justify-content:space-between; font-family:var(--mono); font-size:0.58rem; color:var(--dim); }
+
+  /* Heart Rate */
+  .hr-main { display:flex; align-items:baseline; gap:10px; margin-bottom:4px; }
+  .hr-big { font-family:var(--mono); font-size:2.6rem; font-weight:700; line-height:1; transition: color 0.4s; }
+  .hr-unit { font-family:var(--mono); font-size:1rem; color:var(--dim); }
+  .hr-sub { font-family:var(--mono); font-size:0.75rem; color:var(--dim); margin-bottom:12px; }
+  .hr-bar-wrap { width:100%; height:10px; background:#0a1520; border-radius:5px; overflow:hidden; margin-bottom:5px; }
+  .hr-bar { height:100%; border-radius:5px; transition: width 0.4s ease, background 0.4s ease; }
+  .hr-range { display:flex; justify-content:space-between; font-family:var(--mono); font-size:0.58rem; color:var(--dim); }
+  .hr-beat { display:inline-block; animation: heartbeat 0.6s ease-in-out infinite; }
+  @keyframes heartbeat { 0%,100%{transform:scale(1)} 50%{transform:scale(1.3)} }
+  #hr-overlay { display:none; position:fixed; inset:0; pointer-events:none; z-index:100; background: rgba(255,23,68,0.12); animation: flashbg 0.6s infinite alternate; }
+  #hr-banner { display:none; border-radius:6px; padding:12px 16px; margin-top:10px; background: #cc0033; color:#fff; animation: flashbang 0.4s infinite alternate; }
+
+  /* Alert overlays */
+  #fall-overlay, #temp-overlay {
+    display:none; position:fixed; inset:0; pointer-events:none; z-index:100;
+    animation: flashbg 0.6s infinite alternate;
+  }
+  #fall-overlay { background: rgba(255,23,68,0.15); }
+  #temp-overlay { background: rgba(255,109,0,0.15); }
+  @keyframes flashbg { from{opacity:1} to{opacity:0} }
+
+  #fall-banner, #temp-banner {
+    display:none; border-radius:6px; padding:12px 16px; margin-top:10px;
+    animation: flashbang 0.4s infinite alternate;
+  }
+  #fall-banner { background: var(--red); color:#fff; }
+  #temp-banner { background: var(--orange); color:#fff; }
+  @keyframes flashbang { from{opacity:1} to{opacity:0.5} }
+  .fall-title { font-weight:800; font-size:0.85rem; letter-spacing:0.18em; margin-bottom:8px; }
+  .fall-clear-btn {
+    background:#fff; border:none; border-radius:4px; font-family:var(--mono);
+    font-size:0.72rem; font-weight:700; letter-spacing:0.08em;
+    padding:6px 14px; cursor:pointer; width:100%; margin-top:4px;
+  }
+  #fall-banner .fall-clear-btn { color:var(--red); }
+  #temp-banner .fall-clear-btn { color:var(--orange); }
+  .fall-clear-btn:hover { background:#f0f0f0; }
+
+  /* Helmet */
+  .helmet-row { display:flex; align-items:center; gap:10px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border); }
+  .helmet-icon { font-size:1.2rem; }
+  .helmet-label { font-family:var(--mono); font-size:0.65rem; color:var(--dim); }
+  .helmet-status { font-family:var(--mono); font-size:0.85rem; margin-left:auto; font-weight:700; }
+  .helmet-on  { color:var(--green); }
+  .helmet-off { color:var(--red); animation:flashbang 0.8s infinite alternate; }
+
+  /* GPS */
+  .gps-row { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px; padding-bottom:10px; border-bottom:1px solid var(--border); }
+  .gps-key { font-family:var(--mono); font-size:0.65rem; color:var(--dim); }
+  .gps-val { font-family:var(--mono); font-size:0.9rem; color:var(--green); }
+
+  /* Camera */
+  .cam-panel { grid-column:5; grid-row:1/4; display:flex; flex-direction:column; gap:10px; }
+  #cam-feed { width:100%; border-radius:4px; display:block; border:1px solid var(--border); }
+  .fps-badge { font-family:var(--mono); font-size:0.7rem; color:var(--dim); }
+  .fps-badge span { color:var(--yellow); }
+  .detections-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .det-tag { font-family:var(--mono); font-size:0.65rem; background:#0a1e10; border:1px solid var(--green); color:var(--green); padding:2px 8px; border-radius:3px; }
+
+  /* Status bar */
+  .status-panel { grid-column:1/5; display:flex; gap:16px; align-items:center; padding:10px 16px; }
+  .status-item { display:flex; align-items:center; gap:8px; }
+  .status-dot { width:8px; height:8px; border-radius:50%; }
+  .s-green  { background:var(--green);  box-shadow:0 0 6px var(--green); }
+  .s-red    { background:var(--red);    box-shadow:0 0 6px var(--red);    animation:flashbang 0.6s infinite alternate; }
+  .s-orange { background:var(--orange); box-shadow:0 0 6px var(--orange); animation:flashbang 0.6s infinite alternate; }
+  .s-dim    { background:var(--dim); }
+  .status-label { font-family:var(--mono); font-size:0.65rem; color:var(--dim); }
+
+  /* Alert log */
+  .alerts-panel { grid-column:1/5; }
+  .log-tabs { display:flex; gap:8px; margin-bottom:12px; }
+  .tab-btn { font-family:var(--mono); font-size:0.65rem; letter-spacing:0.15em; padding:4px 14px; border-radius:3px; border:1px solid var(--border); background:transparent; color:var(--dim); cursor:pointer; }
+  .tab-btn.active { background:var(--accent); color:#000; border-color:var(--accent); }
+  .alert-table { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:0.72rem; }
+  .alert-table th { color:var(--dim); font-weight:400; text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); }
+  .alert-table td { padding:5px 8px; border-bottom:1px solid #111d2a; color:var(--text); }
+  .alert-table tr:first-child td { color:var(--red); }
+  .alert-table.temp-log tr:first-child td { color:var(--orange); }
+  .no-alerts { font-family:var(--mono); font-size:0.72rem; color:var(--dim); padding:10px 0; }
+</style>
+</head>
+<body>
+
+<div id="fall-overlay"></div>
+<div id="temp-overlay"></div>
+<div id="hr-overlay"></div>
+
+<header>
+  <div class="dot"></div>
+  <h1>Sensor Dashboard</h1>
+  <div class="sub" id="clock">--:--:--</div>
+</header>
+
+<div class="grid">
+
+  <!-- IMU Panel -->
+  <div class="panel">
+    <div class="panel-label">// IMU &mdash; MPU6050</div>
+    <div class="axis-row">
+      <div class="axis-label">X</div>
+      <div class="axis-bar-wrap"><div class="axis-bar bar-x" id="bar-x" style="width:50%"></div></div>
+      <div class="axis-val" id="val-x">0.000</div>
+    </div>
+    <div class="axis-row">
+      <div class="axis-label">Y</div>
+      <div class="axis-bar-wrap"><div class="axis-bar bar-y" id="bar-y" style="width:50%"></div></div>
+      <div class="axis-val" id="val-y">0.000</div>
+    </div>
+    <div class="axis-row">
+      <div class="axis-label">Z</div>
+      <div class="axis-bar-wrap"><div class="axis-bar bar-z" id="bar-z" style="width:50%"></div></div>
+      <div class="axis-val" id="val-z">9.800</div>
+    </div>
+    <div class="smv-row">
+      <div class="smv-label">SIGNAL MAGNITUDE VECTOR</div>
+      <div class="smv-val" id="val-smv">9.800</div>
+    </div>
+    <div id="fall-banner">
+      <div class="fall-title">&#9888; FALL DETECTED &mdash; WORKER DOWN</div>
+      <button class="fall-clear-btn" onclick="acknowledgeFall()">
+        &#10003; &nbsp;WORKER HAS BEEN ATTENDED TO &mdash; CLEAR ALERT
+      </button>
+    </div>
+    <div class="helmet-row">
+      <div class="helmet-icon">&#9981;</div>
+      <div class="helmet-label">HELMET STATUS</div>
+      <div class="helmet-status" id="helmet-status">--</div>
+    </div>
+  </div>
+
+  <!-- Temperature Panel -->
+  <div class="panel">
+    <div class="panel-label">// TEMP &mdash; MLX90614</div>
+    <div class="temp-main">
+      <div class="temp-big" id="temp-f-big">--.-</div>
+      <div class="temp-unit">&deg;F</div>
+    </div>
+    <div class="temp-sub" id="temp-c-sub">-- &deg;C</div>
+    <div class="temp-bar-wrap">
+      <div class="temp-bar" id="temp-bar" style="width:0%"></div>
+    </div>
+    <div class="temp-range">
+      <span>90&deg;F</span><span>96.8 normal</span><span>103 &#9888;</span><span>110&deg;F</span>
+    </div>
+    <div id="temp-banner" style="margin-top:12px;">
+      <div class="fall-title">&#127777; HIGH TEMP &mdash; HEAT ALERT</div>
+      <button class="fall-clear-btn" onclick="acknowledgeTemp()">
+        &#10003; &nbsp;WORKER HAS BEEN CHECKED &mdash; CLEAR ALERT
+      </button>
+    </div>
+  </div>
+
+  <!-- GPS Panel -->
+  <div class="panel">
+    <div class="panel-label">// GPS &mdash; NEO-6M (SIM)</div>
+    <div class="gps-row">
+      <div class="gps-key">LATITUDE</div>
+      <div class="gps-val" id="gps-lat">Acquiring...</div>
+    </div>
+    <div class="gps-row">
+      <div class="gps-key">LONGITUDE</div>
+      <div class="gps-val" id="gps-lon">Acquiring...</div>
+    </div>
+    <div class="gps-row" style="border:none;margin:0;padding:0">
+      <div class="gps-key">ALTITUDE</div>
+      <div class="gps-val" id="gps-alt">Acquiring...</div>
+    </div>
+  </div>
+
+
+  <!-- Heart Rate Panel -->
+  <div class="panel">
+    <div class="panel-label">// HEART RATE &mdash; PULSE SENSOR</div>
+    <div class="hr-main">
+      <span class="hr-beat">&#10084;</span>&nbsp;
+      <div class="hr-big" id="hr-big">--</div>
+      <div class="hr-unit">BPM</div>
+    </div>
+    <div class="hr-sub">Beats per minute</div>
+    <div class="hr-bar-wrap">
+      <div class="hr-bar" id="hr-bar" style="width:0%"></div>
+    </div>
+    <div class="hr-range">
+      <span>40</span><span>60 resting</span><span>100 normal max</span><span>120 &#9888;</span><span>160</span>
+    </div>
+    <div id="hr-banner" style="margin-top:12px;">
+      <div class="fall-title">&#10084; HIGH HEART RATE &mdash; TACHYCARDIA</div>
+      <button class="fall-clear-btn" onclick="acknowledgeHR()" style="color:#cc0033;">
+        &#10003; &nbsp;WORKER HAS BEEN CHECKED &mdash; CLEAR ALERT
+      </button>
+    </div>
+  </div>
+
+  <!-- Camera Panel -->
+  <div class="panel cam-panel">
+    <div class="panel-label">// CAMERA &mdash; YOLOV8</div>
+    <img id="cam-feed" src="/video_feed" alt="Camera Feed">
+    <div class="fps-badge">FPS: <span id="fps-val">--</span></div>
+    <div class="detections-list" id="det-list"></div>
+  </div>
+
+  <!-- Status Bar -->
+  <div class="panel status-panel">
+    <div class="status-item">
+      <div class="status-dot" id="dot-imu"></div>
+      <div class="status-label">IMU</div>
+    </div>
+    <div class="status-item">
+      <div class="status-dot" id="dot-gps"></div>
+      <div class="status-label">GPS</div>
+    </div>
+    <div class="status-item">
+      <div class="status-dot" id="dot-helmet"></div>
+      <div class="status-label">HELMET</div>
+    </div>
+    <div class="status-item">
+      <div class="status-dot" id="dot-temp"></div>
+      <div class="status-label">TEMP</div>
+    </div>
+    <div class="status-item">
+      <div class="status-dot" id="dot-hr"></div>
+      <div class="status-label">HEART RATE</div>
+    </div>
+    <div class="status-item">
+      <div class="status-dot" id="dot-fall"></div>
+      <div class="status-label">FALL ALERT</div>
+    </div>
+  </div>
+
+  <!-- Alert Log -->
+  <div class="panel alerts-panel">
+    <div class="log-tabs">
+      <button class="tab-btn active" onclick="showTab('fall')">FALL LOG</button>
+      <button class="tab-btn" onclick="showTab('temp')">TEMP LOG</button>
+      <button class="tab-btn" onclick="showTab('hr')">HR LOG</button>
+    </div>
+    <div id="fall-log-body"><div class="no-alerts">No fall events recorded.</div></div>
+    <div id="temp-log-body" style="display:none"><div class="no-alerts">No temperature alerts recorded.</div></div>
+    <div id="hr-log-body" style="display:none"><div class="no-alerts">No heart rate alerts recorded.</div></div>
+  </div>
+
+</div>
+
+<script>
+  function showTab(tab) {
+    document.getElementById('fall-log-body').style.display = tab === 'fall' ? '' : 'none';
+    document.getElementById('temp-log-body').style.display = tab === 'temp' ? '' : 'none';
+    document.getElementById('hr-log-body').style.display   = tab === 'hr'   ? '' : 'none';
+    document.querySelectorAll('.tab-btn').forEach((b,i) => {
+      b.classList.toggle('active',
+        (i===0&&tab==='fall')||(i===1&&tab==='temp')||(i===2&&tab==='hr'));
+    });
+  }
+
+  setInterval(() => {
+    document.getElementById('clock').textContent =
+      new Date().toLocaleTimeString('en-US', {hour12: false});
+  }, 1000);
+
+  function toBar(v) { return ((Math.min(Math.max(v,-20),20)+20)/40*100).toFixed(1)+'%'; }
+  function toTempBar(f) { return Math.min(Math.max((f-90)/20*100,0),100).toFixed(1)+'%'; }
+  function toHRBar(bpm)  { return Math.min(Math.max((bpm-40)/120*100,0),100).toFixed(1)+'%'; }
+  function hrColor(bpm) {
+    if (bpm >= 120) return '#ff1744';
+    if (bpm >= 100) return '#ffd600';
+    return '#39ff14';
+  }
+  function tempColor(f) {
+    if (f >= 103) return '#ff6d00';
+    if (f >= 99)  return '#ffd600';
+    return '#39ff14';
+  }
+
+  async function acknowledgeFall() { await fetch('/api/acknowledge_fall', {method:'POST'}); }
+  async function acknowledgeTemp() { await fetch('/api/acknowledge_temp', {method:'POST'}); }
+  async function acknowledgeHR()   { await fetch('/api/acknowledge_hr',   {method:'POST'}); }
+
+  async function poll() {
+    try {
+      const r = await fetch('/api/state');
+      const d = await r.json();
+
+      // IMU
+      document.getElementById('val-x').textContent   = d.ax.toFixed(3);
+      document.getElementById('val-y').textContent   = d.ay.toFixed(3);
+      document.getElementById('val-z').textContent   = d.az.toFixed(3);
+      document.getElementById('val-smv').textContent = d.smv.toFixed(3);
+      document.getElementById('bar-x').style.width   = toBar(d.ax);
+      document.getElementById('bar-y').style.width   = toBar(d.ay);
+      document.getElementById('bar-z').style.width   = toBar(d.az);
+
+      // Fall
+      document.getElementById('fall-banner').style.display  = d.fall_active ? 'block' : 'none';
+      document.getElementById('fall-overlay').style.display = d.fall_active ? 'block' : 'none';
+
+      // Temp
+      const tf = d.temp_f;
+      const tempBig = document.getElementById('temp-f-big');
+      tempBig.textContent = tf.toFixed(1);
+      tempBig.style.color = tempColor(tf);
+      document.getElementById('temp-c-sub').textContent = d.temp_c.toFixed(1) + ' \u00B0C';
+      const bar = document.getElementById('temp-bar');
+      bar.style.width      = toTempBar(tf);
+      bar.style.background = tempColor(tf);
+      document.getElementById('temp-banner').style.display  = d.temp_alert ? 'block' : 'none';
+      document.getElementById('temp-overlay').style.display = d.temp_alert ? 'block' : 'none';
+
+      // Heart Rate
+      const bpm = d.hr_bpm;
+      const hrBig = document.getElementById('hr-big');
+      hrBig.textContent = bpm > 0 ? bpm : '--';
+      hrBig.style.color = bpm > 0 ? hrColor(bpm) : '#445566';
+      const hrBar = document.getElementById('hr-bar');
+      hrBar.style.width      = toHRBar(bpm);
+      hrBar.style.background = hrColor(bpm);
+      document.getElementById('hr-banner').style.display  = d.hr_alert ? 'block' : 'none';
+      document.getElementById('hr-overlay').style.display = d.hr_alert ? 'block' : 'none';
+
+      // Helmet
+      const hEl = document.getElementById('helmet-status');
+      hEl.textContent = d.helmet_on ? 'ON' : 'OFF';
+      hEl.className   = 'helmet-status ' + (d.helmet_on ? 'helmet-on' : 'helmet-off');
+
+      // GPS
+      document.getElementById('gps-lat').textContent = d.lat;
+      document.getElementById('gps-lon').textContent = d.lon;
+      document.getElementById('gps-alt').textContent = d.alt !== 'No Fix' ? d.alt + ' m' : 'No Fix';
+
+      // Camera
+      document.getElementById('fps-val').textContent = d.fps;
+      document.getElementById('det-list').innerHTML  = d.detections.length
+        ? d.detections.map(t => `<span class="det-tag">${t}</span>`).join('') : '';
+
+      // Status dots
+      const dot = (id, cls) => { document.getElementById(id).className = 'status-dot ' + cls; };
+      dot('dot-imu',    d.smv > 0          ? 's-green'  : 's-dim');
+      dot('dot-gps',    d.lat !== 'No Fix' ? 's-green'  : 's-dim');
+      dot('dot-helmet', d.helmet_on        ? 's-green'  : 's-dim');
+      dot('dot-temp',   d.temp_alert       ? 's-orange' : 's-green');
+      dot('dot-hr',     d.hr_alert         ? 's-red'    : (d.hr_bpm > 0 ? 's-green' : 's-dim'));
+      dot('dot-fall',   d.fall_active      ? 's-red'    : 's-dim');
+
+      // HR log
+      document.getElementById('hr-log-body').innerHTML = !d.hr_alerts.length
+        ? '<div class="no-alerts">No heart rate alerts recorded.</div>'
+        : `<table class="alert-table temp-log"><thead><tr>
+            <th>TIME</th><th>BPM</th><th>LAT</th><th>LON</th>
+           </tr></thead><tbody>${d.hr_alerts.map(a=>
+            `<tr><td>${a.time}</td><td>${a.bpm}</td><td>${a.lat}</td><td>${a.lon}</td></tr>`
+           ).join('')}</tbody></table>`;
+
+      // Fall log
+      document.getElementById('fall-log-body').innerHTML = !d.alerts.length
+        ? '<div class="no-alerts">No fall events recorded.</div>'
+        : `<table class="alert-table"><thead><tr>
+            <th>TIME</th><th>LAT</th><th>LON</th><th>SMV (m/s\u00B2)</th>
+           </tr></thead><tbody>${d.alerts.map(a=>
+            `<tr><td>${a.time}</td><td>${a.lat}</td><td>${a.lon}</td><td>${a.smv}</td></tr>`
+           ).join('')}</tbody></table>`;
+
+      // Temp log
+      document.getElementById('temp-log-body').innerHTML = !d.temp_alerts.length
+        ? '<div class="no-alerts">No temperature alerts recorded.</div>'
+        : `<table class="alert-table temp-log"><thead><tr>
+            <th>TIME</th><th>\u00B0F</th><th>\u00B0C</th><th>LAT</th><th>LON</th>
+           </tr></thead><tbody>${d.temp_alerts.map(a=>
+            `<tr><td>${a.time}</td><td>${a.temp_f}</td><td>${a.temp_c}</td><td>${a.lat}</td><td>${a.lon}</td></tr>`
+           ).join('')}</tbody></table>`;
+
+    } catch(e) { /* silently retry */ }
+  }
+
+  setInterval(poll, 500);
+  poll();
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(DASHBOARD_HTML)
+
+@app.route("/api/state")
+def api_state():
+    with state_lock:
+        return jsonify(dict(state))
+
+@app.route("/api/acknowledge_fall", methods=["POST"])
+def acknowledge_fall():
+    with state_lock:
+        state["fall_active"] = False
+    print("[ACK] Fall acknowledged.")
+    return jsonify({"status": "cleared"})
+
+@app.route("/api/acknowledge_temp", methods=["POST"])
+def acknowledge_temp():
+    with state_lock:
+        state["temp_alert"] = False
+    print("[ACK] Temp alert acknowledged.")
+    return jsonify({"status": "cleared"})
+
+def mjpeg_generator():
+    global latest_jpeg
+    while True:
+        with frame_lock:
+            frame = latest_jpeg
+        if frame:
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+        time.sleep(0.03)
+
+@app.route("/api/acknowledge_hr", methods=["POST"])
+def acknowledge_hr():
+    with state_lock:
+        state["hr_alert"] = False
+    print("[ACK] HR alert acknowledged.")
+    return jsonify({"status": "cleared"})
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(mjpeg_generator(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
