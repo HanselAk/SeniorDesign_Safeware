@@ -1,12 +1,10 @@
 """
 Unified Sensor Dashboard - Raspberry Pi
-Combines: MPU6050 (XYZ/fall) + SIMULATED GPS + YOLOv8 Camera + MLX90614 (temp) + MCP3008/Pulse (HR)
+Combines: MPU6050 (XYZ/fall) + REAL GPS (NEO-6M) + YOLOv8 Camera + MLX90614 (temp) + MAX30102 (HR/SpO2)
 Hardware: Passive buzzer GPIO17, LED GPIO27, Touch sensor GPIO23
 Dashboard: served over WiFi via Flask
 
-NOTE: GPS module hardware is currently bypassed -- using simulated GPS data
-that random-walks around a construction site near Marietta, GA.
-To switch back to real GPS later: restore gps_thread() and remove sim_gps_thread().
+GPS: Uses gpsd service or direct serial connection
 """
 
 import math
@@ -22,15 +20,86 @@ from flask import Flask, Response, jsonify, render_template_string, request
 from mpu6050 import mpu6050
 from ultralytics import YOLO
 from picamera2 import Picamera2
+from max30102 import MAX30102  # This will now find the local file
+import serial
+import pynmea2
+import subprocess
+import os
 
-# ---------------------------------------------------------------------
+## ---------------------------------------------------------------------
 # EMAIL CONFIG -- loaded from ~/email_config.py on the Pi
 # ---------------------------------------------------------------------
+import ssl
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
+SMTP_TIMEOUT = 20          # seconds, prevents a hung thread
+
+EMAIL_ENABLED = False
 try:
     from email_config import EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER
+    if all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER]):
+        EMAIL_ENABLED = True
+        print(f"[EMAIL] Alerts enabled -> {EMAIL_RECEIVER}")
+    else:
+        print("[EMAIL] email_config.py has empty values -- alerts disabled.")
 except ImportError:
     EMAIL_SENDER = EMAIL_PASSWORD = EMAIL_RECEIVER = None
-    print("[EMAIL] email_config.py not found -- email alerts disabled.")
+    print("[EMAIL] email_config.py not found -- alerts disabled.")
+
+
+# ---------------------------------------------------------------------
+# EMAIL ALERT FUNCTION
+# ---------------------------------------------------------------------
+def send_email(subject, body, alert_type):
+    if not EMAIL_ENABLED:
+        return
+
+    now = time.time()
+    last = _email_cooldowns.get(alert_type, 0)
+    if now - last < EMAIL_COOLDOWN:
+        remaining = int(EMAIL_COOLDOWN - (now - last))
+        print(f"[EMAIL] {alert_type} cooldown active, {remaining}s left")
+        return
+
+    # Claim the cooldown slot immediately so two threads firing the same
+    # alert type at once cannot both get through.
+    _email_cooldowns[alert_type] = now
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+
+    ctx = ssl.create_default_context()
+
+    for attempt in (1, 2):
+        try:
+            t0 = time.time()
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT,
+                                  context=ctx, timeout=SMTP_TIMEOUT) as server:
+                server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+            print(f"[EMAIL] {alert_type} alert sent in {time.time()-t0:.1f}s")
+            return
+
+        except smtplib.SMTPAuthenticationError:
+            print("[EMAIL ERROR] Login rejected. Regenerate the Gmail "
+                  "App Password in email_config.py.")
+            return                      # retrying will not help
+
+        except (smtplib.SMTPServerDisconnected, TimeoutError, OSError) as e:
+            if attempt == 1:
+                print(f"[EMAIL] Network issue ({type(e).__name__}), retrying...")
+                time.sleep(2.0)
+                continue
+            print(f"[EMAIL ERROR] {alert_type} failed after retry: {e}")
+            _email_cooldowns[alert_type] = 0    # allow the next alert to try
+
+        except Exception as e:
+            print(f"[EMAIL ERROR] {type(e).__name__}: {e}")
+            _email_cooldowns[alert_type] = 0
+            return
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -40,22 +109,30 @@ CONF              = 0.45
 IOU               = 0.45
 IMGSZ             = 256
 CAM_W, CAM_H      = 480, 360
-FREE_FALL_THRESH  = 3.0
-IMPACT_THRESH     = 20.0
-IMPACT_WINDOW     = 1.5
+FREE_FALL_THRESH  = 4.5  #base is 3.0
+IMPACT_THRESH     = 12.0 #change to 20 later 
+IMPACT_WINDOW     = 1.5  #change to 1.5
 SAMPLE_RATE       = 0.02
 MAX_ALERTS        = 20
-TEMP_ALERT_F      = 103.0    # F threshold for heat alert
-HR_ALERT_BPM      = 120       # BPM threshold for tachycardia alert
-HR_SAMPLE_WINDOW  = 10        # seconds of samples to average BPM over
+TEMP_ALERT_F      = 103.0
+HR_ALERT_BPM      = 120
+EMAIL_COOLDOWN    = 300
+# --- Heart rate (MAX30102) ---
+HR_FINGER_THRESHOLD = 50000   # IR below this means no skin contact
+HR_LED_CURRENT      = 0x24    # raise toward 0x3F if IR reads low
+HR_MIN_AMPLITUDE    = 40      # min AC swing before beats are trusted
+HR_REFRACTORY       = 0.30    # seconds, blocks double-triggering
+HR_MIN_BEATS        = 4       # intervals needed before publishing
+HR_MAX_SPREAD       = 0.30    # interval spread ratio for "good" quality
 
-# --- GPS simulator config ---
-SIM_BASE_LAT      = 33.93994
-SIM_BASE_LON      = -84.52011
-SIM_BASE_ALT      = 310.0
-SIM_SITE_RADIUS_M = 80        # keep worker within this radius
-SIM_WALK_SPEED    = 1.2       # m/s (walking pace)
-SIM_UPDATE_HZ     = 1.0       # GPS-style 1 Hz
+# --- Dashboard URL used in email alerts ---
+import socket
+DASHBOARD_URL = f"http://{socket.gethostname()}.local:5000"
+# --- GPS Configuration ---
+GPS_SERIAL_PORT   = "/dev/serial0"
+GPS_BAUDRATE      = 9600
+GPS_USE_GPSD      = True
+GPS_TIMEOUT       = 5.0
 
 # GPIO pins
 PIN_BUZZER  = 17
@@ -64,7 +141,10 @@ PIN_TOUCH   = 23
 
 # MLX90614 I2C
 MLX_ADDR      = 0x5A
-MLX_RAM_TOBJ1 = 0x07   # object temperature register
+MLX_RAM_TOBJ1 = 0x07
+
+# MAX30102 I2C
+MAX_ADDR      = 0x57
 
 # ---------------------------------------------------------------------
 # GPIO SETUP
@@ -86,6 +166,9 @@ state_lock = threading.Lock()
 state = {
     "ax": 0.0, "ay": 0.0, "az": 0.0, "smv": 0.0,
     "lat": "No Fix", "lon": "No Fix", "alt": "No Fix",
+    "gps_fix": False,
+    "gps_satellites": 0,
+    "gps_quality": "No Fix",
     "fall": False,
     "fall_active": False,
     "helmet_on": False,
@@ -97,6 +180,8 @@ state = {
     "hr_bpm": 0,
     "hr_alert": False,
     "hr_alerts": [],
+    "hr_quality": "no contact",
+    "hr_contact": False,
     "detections": [],
     "fps": 0.0,
 }
@@ -105,33 +190,181 @@ frame_lock  = threading.Lock()
 latest_jpeg = None
 stop_event  = threading.Event()
 
+_email_cooldowns = {
+    "fall": 0,
+    "temp": 0,
+    "hr": 0
+}
+
 
 # ---------------------------------------------------------------------
-# EMAIL ALERT FUNCTION
+# GPS THREAD - Real NEO-6M
 # ---------------------------------------------------------------------
-def send_email(subject, body):
-    if not EMAIL_SENDER:
-        return
-    try:
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"]    = EMAIL_SENDER
-        msg["To"]      = EMAIL_RECEIVER
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        print("[EMAIL] Alert sent successfully.")
-    except Exception as e:
-        print(f"[EMAIL ERROR] {e}")
+class GPSReceiver:
+    def __init__(self):
+        self.serial = None
+        self.gpsd_running = False
+        self.fix = False
+        self.lat = 0.0
+        self.lon = 0.0
+        self.alt = 0.0
+        self.satellites = 0
+        self.quality = "No Fix"
+        
+    def start_gpsd(self):
+        try:
+            result = subprocess.run(['pgrep', 'gpsd'], capture_output=True, text=True)
+            if result.stdout.strip():
+                print("[GPS] gpsd already running")
+                self.gpsd_running = True
+                return True
+            
+            print("[GPS] Starting gpsd...")
+            subprocess.run(['sudo', 'gpsd', GPS_SERIAL_PORT, '-F', '/var/run/gpsd.sock'], 
+                          check=True, capture_output=True)
+            self.gpsd_running = True
+            print("[GPS] gpsd started successfully")
+            return True
+        except Exception as e:
+            print(f"[GPS] Failed to start gpsd: {e}")
+            return False
+    
+    def connect_direct(self):
+        try:
+            self.serial = serial.Serial(GPS_SERIAL_PORT, GPS_BAUDRATE, timeout=1.0)
+            print(f"[GPS] Connected directly to {GPS_SERIAL_PORT}")
+            return True
+        except Exception as e:
+            print(f"[GPS] Failed to connect to {GPS_SERIAL_PORT}: {e}")
+            return False
+    
+    def read_gpsd(self):
+        try:
+            import gps
+            session = gps.gps(mode=gps.WATCH_ENABLE)
+            
+            start_time = time.time()
+            while time.time() - start_time < GPS_TIMEOUT:
+                try:
+                    report = session.next()
+                    if report['class'] == 'TPV':
+                        if hasattr(report, 'lat') and hasattr(report, 'lon'):
+                            self.lat = report.lat
+                            self.lon = report.lon
+                            self.fix = True
+                            if hasattr(report, 'alt'):
+                                self.alt = report.alt
+                            return
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                
+        except Exception as e:
+            print(f"[GPS] gpsd read error: {e}")
+            self.fix = False
+            
+    def read_serial_nmea(self):
+        try:
+            start_time = time.time()
+            while time.time() - start_time < GPS_TIMEOUT:
+                if self.serial.in_waiting:
+                    line = self.serial.readline().decode('ascii', errors='ignore')
+                    if line.startswith('$GPGGA'):
+                        try:
+                            msg = pynmea2.parse(line)
+                            if msg.gps_qual > 0:
+                                self.lat = msg.latitude
+                                self.lon = msg.longitude
+                                self.alt = msg.altitude
+                                self.satellites = msg.num_sats
+                                self.quality = ["No Fix", "GPS", "DGPS", "PPS", "RTK", "Float RTK", 
+                                               "Estimated", "Manual", "Simulation"][msg.gps_qual]
+                                self.fix = True
+                                return
+                        except pynmea2.ParseError:
+                            pass
+                time.sleep(0.1)
+                
+        except Exception as e:
+            print(f"[GPS] Serial read error: {e}")
+            self.fix = False
+    
+    def get_position(self):
+        if GPS_USE_GPSD:
+            self.read_gpsd()
+        else:
+            self.read_serial_nmea()
+        
+        if self.fix:
+            return {
+                "lat": round(self.lat, 6),
+                "lon": round(self.lon, 6),
+                "alt": round(self.alt, 1),
+                "fix": True,
+                "satellites": self.satellites,
+                "quality": self.quality
+            }
+        else:
+            return {
+                "lat": "No Fix",
+                "lon": "No Fix",
+                "alt": "No Fix",
+                "fix": False,
+                "satellites": 0,
+                "quality": "No Fix"
+            }
+
+def gps_thread():
+    gps_receiver = GPSReceiver()
+    
+    if GPS_USE_GPSD:
+        if not gps_receiver.start_gpsd():
+            print("[GPS] Falling back to direct serial connection")
+            gps_receiver.connect_direct()
+    else:
+        if not gps_receiver.connect_direct():
+            print("[GPS] WARNING: Cannot connect to GPS module")
+    
+    print("[GPS] Waiting for GPS fix...")
+    fix_timeout = time.time() + 60
+    
+    while not stop_event.is_set():
+        try:
+            position = gps_receiver.get_position()
+            
+            with state_lock:
+                state["lat"] = position["lat"]
+                state["lon"] = position["lon"]
+                state["alt"] = position["alt"]
+                state["gps_fix"] = position["fix"]
+                state["gps_satellites"] = position.get("satellites", 0)
+                state["gps_quality"] = position.get("quality", "No Fix")
+            
+            if position["fix"]:
+                print(f"[GPS] Fix acquired: {position['lat']}, {position['lon']} "
+                      f"(Satellites: {position.get('satellites', 0)})")
+                fix_timeout = time.time() + 60
+            elif time.time() > fix_timeout:
+                if time.time() % 30 < 1:
+                    print("[GPS] Still waiting for GPS fix... (Check antenna placement)")
+            
+            time.sleep(1.0)
+            
+        except Exception as e:
+            print(f"[GPS ERROR] {e}")
+            time.sleep(2.0)
 
 # ---------------------------------------------------------------------
 # MLX90614 TEMPERATURE THREAD
 # ---------------------------------------------------------------------
 def read_mlx90614(bus):
-    raw    = bus.read_word_data(MLX_ADDR, MLX_RAM_TOBJ1)
-    temp_k = raw * 0.02
-    temp_c = temp_k - 273.15
-    return temp_c
+    try:
+        raw    = bus.read_word_data(MLX_ADDR, MLX_RAM_TOBJ1)
+        temp_k = raw * 0.02
+        temp_c = temp_k - 273.15
+        return temp_c
+    except Exception:
+        return None
 
 def temp_thread():
     try:
@@ -143,6 +376,10 @@ def temp_thread():
     while not stop_event.is_set():
         try:
             temp_c = read_mlx90614(bus)
+            if temp_c is None:
+                time.sleep(1.0)
+                continue
+                
             temp_f = temp_c * 9.0 / 5.0 + 32.0
 
             with state_lock:
@@ -161,108 +398,327 @@ def temp_thread():
                     state["temp_alerts"].insert(0, alert)
                     if len(state["temp_alerts"]) > MAX_ALERTS:
                         state["temp_alerts"].pop()
-                    tf_snap = round(temp_f, 1)
-                    tc_snap = round(temp_c, 1)
-                    lat_snap2 = state["lat"]
-                    lon_snap2 = state["lon"]
                     print(f"[TEMP ALERT] {temp_f:.1f}F exceeds threshold!")
-                    t2 = threading.Thread(target=send_email, daemon=True, args=(
+                    threading.Thread(target=send_email, daemon=True, args=(
                         "HIGH TEMP ALERT -- Worker Overheating",
-                        f"Worker temperature exceeded 103F.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nTemp: {tf_snap}F / {tc_snap}C\nLat: {lat_snap2}\nLon: {lon_snap2}\n\nDashboard: http://192.168.1.212:5000"
-                    ))
-                    t2.start()
+                        f"Worker temperature exceeded 103F.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nTemp: {temp_f:.1f}F / {temp_c:.1f}C\nLat: {state['lat']}\nLon: {state['lon']}\n\nDashboard: http://192.168.1.212:5000",
+                        "temp"
+                    )).start()
+                elif temp_f < (TEMP_ALERT_F - 2.0) and state["temp_alert"]:
+                    state["temp_alert"] = False
 
         except Exception as e:
             print(f"[TEMP ERROR] {e}")
 
         time.sleep(1.0)
 
-
 # ---------------------------------------------------------------------
-# HEART RATE THREAD -- MCP3008 + analog pulse sensor on CH0
+# HEART RATE THREAD -- MAX30102
+# ---------------------------------------------------------------------
+# HEART RATE -- MAX30102 DRIVER
+# ---------------------------------------------------------------------
+class MAX30102Driver:
+    """Minimal MAX30102 driver over smbus2. No external library needed."""
+ 
+    REG_INTR_STATUS_1 = 0x00
+    REG_INTR_STATUS_2 = 0x01
+    REG_INTR_ENABLE_1 = 0x02
+    REG_INTR_ENABLE_2 = 0x03
+    REG_FIFO_WR_PTR   = 0x04
+    REG_OVF_COUNTER   = 0x05
+    REG_FIFO_RD_PTR   = 0x06
+    REG_FIFO_DATA     = 0x07
+    REG_FIFO_CONFIG   = 0x08
+    REG_MODE_CONFIG   = 0x09
+    REG_SPO2_CONFIG   = 0x0A
+    REG_LED1_PA       = 0x0C
+    REG_LED2_PA       = 0x0D
+    REG_PILOT_PA      = 0x10
+    REG_PART_ID       = 0xFF
+ 
+    def __init__(self, bus_num=1, address=MAX_ADDR):
+        self.bus = smbus2.SMBus(bus_num)
+        self.address = address
+ 
+    def _w(self, reg, val):
+        self.bus.write_byte_data(self.address, reg, val)
+ 
+    def _r(self, reg):
+        return self.bus.read_byte_data(self.address, reg)
+ 
+    def get_part_id(self):
+        return self._r(self.REG_PART_ID)
+ 
+    def setup(self):
+        self._w(self.REG_MODE_CONFIG, 0x40)          # soft reset
+        time.sleep(0.1)
+        self._w(self.REG_INTR_ENABLE_1, 0xC0)
+        self._w(self.REG_INTR_ENABLE_2, 0x00)
+        self._w(self.REG_FIFO_WR_PTR, 0x00)
+        self._w(self.REG_OVF_COUNTER, 0x00)
+        self._w(self.REG_FIFO_RD_PTR, 0x00)
+        self._w(self.REG_FIFO_CONFIG, 0x1F)          # no averaging, rollover on
+        self._w(self.REG_MODE_CONFIG, 0x03)          # SpO2 mode: LED1 red, LED2 IR
+        self._w(self.REG_SPO2_CONFIG, 0x27)          # 4096nA, 100 sps, 411us, 18 bit
+        self._w(self.REG_LED1_PA, HR_LED_CURRENT)
+        self._w(self.REG_LED2_PA, HR_LED_CURRENT)
+        self._w(self.REG_PILOT_PA, 0x7F)
+ 
+    def data_available(self):
+        """Unread samples sitting in the FIFO, 0 to 31."""
+        wr = self._r(self.REG_FIFO_WR_PTR)
+        rd = self._r(self.REG_FIFO_RD_PTR)
+        n = wr - rd
+        return n + 32 if n < 0 else n
+ 
+    def read_fifo(self):
+        """One sample. Returns (red, ir) as 18 bit counts."""
+        d = self.bus.read_i2c_block_data(self.address, self.REG_FIFO_DATA, 6)
+        red = ((d[0] << 16) | (d[1] << 8) | d[2]) & 0x03FFFF
+        ir  = ((d[3] << 16) | (d[4] << 8) | d[5]) & 0x03FFFF
+        return red, ir
+ 
+    def shutdown(self):
+        try:
+            self._w(self.REG_MODE_CONFIG, 0x80)
+            self.bus.close()
+        except Exception:
+            pass
+ 
+ 
+# ---------------------------------------------------------------------
+# HEART RATE -- BEAT DETECTOR
+# ---------------------------------------------------------------------
+class BeatDetector:
+    """
+    Adaptive threshold peak detector for reflectance PPG.
+ 
+    Feed it IR samples with feed(ir). Returns True on the sample where a
+    beat is confirmed. Read .bpm and .quality for the current estimate.
+    """
+ 
+    SMOOTH_N   = 4       # moving average window
+    DC_ALPHA   = 0.03    # DC tracker, about 0.3 s at 100 sps
+    ENV_DECAY  = 0.995   # amplitude envelope decay
+    TRIG_RATIO = 0.35    # fraction of envelope that counts as a beat
+    HIST_LEN   = 8       # intervals kept for the median
+ 
+    def __init__(self):
+        self.reset()
+ 
+    def reset(self):
+        self._window = []
+        self._dc = None
+        self._env = 0.0
+        self._prev_ac = 0.0
+        self._last_beat = 0.0
+        self._intervals = []
+        self.bpm = 0
+        self.quality = "no contact"
+ 
+    def feed(self, ir, now):
+        # 1. moving average
+        self._window.append(ir)
+        if len(self._window) > self.SMOOTH_N:
+            self._window.pop(0)
+        smooth = sum(self._window) / len(self._window)
+ 
+        # 2. DC removal
+        if self._dc is None:
+            self._dc = smooth
+            self._prev_ac = 0.0
+            self._last_beat = now
+            return False
+        self._dc = self._dc * (1.0 - self.DC_ALPHA) + smooth * self.DC_ALPHA
+        ac = smooth - self._dc
+ 
+        # 3. amplitude envelope
+        mag = abs(ac)
+        if mag > self._env:
+            self._env = mag
+        else:
+            self._env = self._env * self.ENV_DECAY + mag * (1.0 - self.ENV_DECAY)
+ 
+        beat = False
+ 
+        # 4. threshold crossing with refractory period
+        if self._env >= HR_MIN_AMPLITUDE:
+            trig = self._env * self.TRIG_RATIO
+            if (self._prev_ac <= trig < ac
+                    and (now - self._last_beat) > HR_REFRACTORY):
+                delta = now - self._last_beat
+                self._last_beat = now
+                if 0.30 < delta < 2.0:          # 30 to 200 BPM
+                    self._intervals.append(delta)
+                    if len(self._intervals) > self.HIST_LEN:
+                        self._intervals.pop(0)
+                    beat = True
+ 
+        self._prev_ac = ac
+ 
+        # 5. estimate from the MEDIAN interval
+        n = len(self._intervals)
+        if n >= HR_MIN_BEATS:
+            s = sorted(self._intervals)
+            med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+            spread = (s[-1] - s[0]) / med if med > 0 else 9.9
+            self.bpm = int(round(60.0 / med))
+            self.quality = "good" if spread <= HR_MAX_SPREAD else "noisy"
+        else:
+            self.bpm = 0
+            self.quality = f"settling {n}/{HR_MIN_BEATS}"
+ 
+        return beat
+ 
+ 
+# ---------------------------------------------------------------------
+# HEART RATE THREAD -- MAX30102
 # ---------------------------------------------------------------------
 def hr_thread():
+    sensor = None
     try:
-        import spidev
-        spi = spidev.SpiDev()
-        spi.open(0, 0)
-        spi.max_speed_hz = 1350000
-        spi.mode = 0
+        sensor = MAX30102Driver()
+        part_id = sensor.get_part_id()
+ 
+        if part_id == 0x15:
+            print(f"[HR] MAX30102 confirmed (Part ID: 0x{part_id:02X})")
+        elif part_id == 0x11:
+            print(f"[HR] MAX30100 detected (Part ID: 0x{part_id:02X}) -- unsupported")
+            sensor.shutdown()
+            return
+        else:
+            print(f"[HR] Unknown sensor (Part ID: 0x{part_id:02X})")
+            sensor.shutdown()
+            return
+ 
+        sensor.setup()
+        print("[HR] MAX30102 ready on I2C. Place fingertip on the sensor.")
+ 
     except Exception as e:
-        print(f"[HR ERROR] Could not init MCP3008 SPI: {e}")
+        print(f"[HR ERROR] Could not init MAX30102: {e}")
+        if sensor:
+            sensor.shutdown()
         return
-
-    def read_mcp3008(channel=0):
-        r = spi.xfer2([1, (8 + channel) << 4, 0])
-        return ((r[1] & 3) << 8) | r[2]
-
-    print("[HR] Heart rate sensor ready on MCP3008 CH0")
-
-    peak_times = []
-    last_val   = 0
-    rising     = False
-    threshold  = 512
-
-    while not stop_event.is_set():
-        try:
-            val = read_mcp3008(0)
-
-            if not rising and val > threshold and last_val <= threshold:
-                rising = True
-                now = time.time()
-                peak_times.append(now)
-                peak_times = [t for t in peak_times if now - t <= HR_SAMPLE_WINDOW]
-
-            elif rising and val < threshold:
-                rising = False
-
-            last_val = val
-
-            bpm = 0
-            if len(peak_times) >= 2:
-                intervals = [peak_times[i+1] - peak_times[i]
-                             for i in range(len(peak_times)-1)]
-                avg_interval = sum(intervals) / len(intervals)
-                if avg_interval > 0:
-                    bpm = int(60.0 / avg_interval)
-
-            with state_lock:
-                state["hr_bpm"] = bpm
-
-                if bpm >= HR_ALERT_BPM and not state["hr_alert"]:
-                    state["hr_alert"] = True
-                    alert = {
-                        "time":  time.strftime("%H:%M:%S"),
-                        "bpm":   bpm,
-                        "lat":   state["lat"],
-                        "lon":   state["lon"],
-                    }
-                    state["hr_alerts"].insert(0, alert)
-                    if len(state["hr_alerts"]) > MAX_ALERTS:
-                        state["hr_alerts"].pop()
-                    print(f"[HR ALERT] {bpm} BPM exceeds threshold!")
-                    lat_s = state["lat"]
-                    lon_s = state["lon"]
-                    t_email = threading.Thread(target=send_email, daemon=True, args=(
-                        "HIGH HEART RATE ALERT -- Tachycardia Detected",
-                        f"Worker heart rate exceeded 120 BPM.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nBPM: {bpm}\nLat: {lat_s}\nLon: {lon_s}\n\nDashboard: http://192.168.1.212:5000"
-                    ))
-                    t_email.start()
-
-                elif bpm < HR_ALERT_BPM and state["hr_alert"] and bpm > 0:
-                    state["hr_alert"] = False
-
-        except Exception as e:
-            print(f"[HR ERROR] {e}")
-
-        time.sleep(0.02)
+ 
+    detector = BeatDetector()
+    contact = False
+    last_status = 0.0
+    consecutive_errors = 0
+ 
+    try:
+        while not stop_event.is_set():
+            try:
+                pending = sensor.data_available()
+ 
+                if pending == 0:
+                    time.sleep(0.005)
+                    continue
+ 
+                # Drain the FIFO. Only the newest sample drives detection if
+                # we fell behind, but every sample is consumed so pointers
+                # stay in sync.
+                for _ in range(min(pending, 16)):
+                    red, ir = sensor.read_fifo()
+                    now = time.time()
+ 
+                    # ---- contact check ----
+                    if ir < HR_FINGER_THRESHOLD:
+                        if contact:
+                            print("[HR] Contact lost.")
+                            contact = False
+                            detector.reset()
+                            with state_lock:
+                                state["hr_bpm"] = 0
+                                state["hr_contact"] = False
+                                state["hr_quality"] = "no contact"
+                        continue
+ 
+                    if not contact:
+                        contact = True
+                        detector.reset()
+                        print(f"[HR] Contact detected (IR={ir}).")
+                        with state_lock:
+                            state["hr_contact"] = True
+ 
+                    detector.feed(ir, now)
+ 
+                consecutive_errors = 0
+ 
+                # ---- publish + alerting ----
+                if contact:
+                    bpm = detector.bpm
+                    quality = detector.quality
+ 
+                    with state_lock:
+                        state["hr_bpm"] = bpm
+                        state["hr_quality"] = quality
+ 
+                        # Alert only on trustworthy data. A loose finger
+                        # otherwise produces false tachycardia emails.
+                        if (quality == "good"
+                                and bpm >= HR_ALERT_BPM
+                                and not state["hr_alert"]):
+                            state["hr_alert"] = True
+                            alert = {
+                                "time": time.strftime("%H:%M:%S"),
+                                "bpm":  bpm,
+                                "lat":  state["lat"],
+                                "lon":  state["lon"],
+                            }
+                            state["hr_alerts"].insert(0, alert)
+                            if len(state["hr_alerts"]) > MAX_ALERTS:
+                                state["hr_alerts"].pop()
+                            print(f"[HR ALERT] {bpm} BPM exceeds threshold!")
+                            threading.Thread(target=send_email, daemon=True, args=(
+                                "HIGH HEART RATE ALERT -- Tachycardia Detected",
+                                f"Worker heart rate exceeded {HR_ALERT_BPM} BPM.\n\n"
+                                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"BPM: {bpm}\n"
+                                f"Lat: {state['lat']}\n"
+                                f"Lon: {state['lon']}\n\n"
+                                f"Dashboard: {DASHBOARD_URL}",
+                                "hr"
+                            )).start()
+ 
+                        elif (quality == "good"
+                                and bpm < (HR_ALERT_BPM - 10)
+                                and state["hr_alert"]):
+                            state["hr_alert"] = False
+ 
+                    if time.time() - last_status > 2.0:
+                        print(f"[HR] {bpm} BPM  ({quality})")
+                        last_status = time.time()
+ 
+            except OSError as e:
+                # I2C hiccup. Back off briefly, re-init after repeated failures.
+                consecutive_errors += 1
+                print(f"[HR ERROR] I2C: {e} (x{consecutive_errors})")
+                time.sleep(0.2)
+                if consecutive_errors >= 10:
+                    print("[HR] Re-initializing sensor.")
+                    try:
+                        sensor.setup()
+                        detector.reset()
+                        contact = False
+                        consecutive_errors = 0
+                    except Exception as re_e:
+                        print(f"[HR ERROR] Re-init failed: {re_e}")
+                        time.sleep(2.0)
+ 
+            except Exception as e:
+                print(f"[HR ERROR] {e}")
+                time.sleep(0.1)
+ 
+    finally:
+        sensor.shutdown()
+        print("[HR] Sensor stopped.")
 
 # ---------------------------------------------------------------------
 # BUZZER + LED THREAD
 # ---------------------------------------------------------------------
 def alert_hardware_thread():
-    gpio_init()
     buzzer_on = False
+    
     while not stop_event.is_set():
         with state_lock:
             active = state["fall_active"] or state["temp_alert"] or state["hr_alert"]
@@ -279,7 +735,7 @@ def alert_hardware_thread():
             if buzzer_on:
                 buzzer_pwm.stop()
                 buzzer_on = False
-            GPIO.output(PIN_LED,    GPIO.LOW)
+            GPIO.output(PIN_LED, GPIO.LOW)
             GPIO.output(PIN_BUZZER, GPIO.LOW)
             time.sleep(0.1)
 
@@ -287,18 +743,33 @@ def alert_hardware_thread():
 # TOUCH SENSOR THREAD
 # ---------------------------------------------------------------------
 def touch_thread():
-    gpio_init()
+    debounce_counter = 0
+    last_reading = False
+    
     while not stop_event.is_set():
         reading = GPIO.input(PIN_TOUCH)
-        with state_lock:
-            state["helmet_on"] = bool(reading)
-        time.sleep(0.1)
+        
+        if reading == last_reading:
+            debounce_counter += 1
+            if debounce_counter >= 5:
+                with state_lock:
+                    state["helmet_on"] = bool(reading)
+        else:
+            debounce_counter = 0
+            last_reading = reading
+            
+        time.sleep(0.02)
 
 # ---------------------------------------------------------------------
 # IMU + FALL DETECTION THREAD
 # ---------------------------------------------------------------------
 def imu_thread():
-    sensor = mpu6050(0x68)
+    try:
+        sensor = mpu6050(0x68)
+    except Exception as e:
+        print(f"[IMU ERROR] Could not init MPU6050: {e}")
+        return
+        
     in_freefall   = False
     freefall_time = None
 
@@ -317,25 +788,25 @@ def imu_thread():
                 if smv > IMPACT_THRESH:
                     fall_now    = True
                     in_freefall = False
+                    
                     with state_lock:
-                        alert = {
-                            "time": time.strftime("%H:%M:%S"),
-                            "lat":  state["lat"],
-                            "lon":  state["lon"],
-                            "smv":  round(smv, 2),
-                        }
-                        state["alerts"].insert(0, alert)
-                        if len(state["alerts"]) > MAX_ALERTS:
-                            state["alerts"].pop()
-                        state["fall_active"] = True
-                        lat_snap = state["lat"]
-                        lon_snap = state["lon"]
-                        smv_snap = round(smv, 2)
-                    t = threading.Thread(target=send_email, daemon=True, args=(
-                        "FALL DETECTED -- Worker Down",
-                        f"A fall was detected.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nSMV: {smv_snap} m/s^2\nLat: {lat_snap}\nLon: {lon_snap}\n\nDashboard: http://192.168.1.212:5000"
-                    ))
-                    t.start()
+                        if not state["fall_active"]:
+                            alert = {
+                                "time": time.strftime("%H:%M:%S"),
+                                "lat":  state["lat"],
+                                "lon":  state["lon"],
+                                "smv":  round(smv, 2),
+                            }
+                            state["alerts"].insert(0, alert)
+                            if len(state["alerts"]) > MAX_ALERTS:
+                                state["alerts"].pop()
+                            state["fall_active"] = True
+                            threading.Thread(target=send_email, daemon=True, args=(
+                                "FALL DETECTED -- Worker Down",
+                                f"A fall was detected.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nSMV: {round(smv, 2)} m/s^2\nLat: {state['lat']}\nLon: {state['lon']}\n\nDashboard: http://192.168.1.212:5000",
+                                "fall"
+                            )).start()
+                        
                 elif time.time() - freefall_time > IMPACT_WINDOW:
                     in_freefall = False
 
@@ -352,98 +823,31 @@ def imu_thread():
         time.sleep(SAMPLE_RATE)
 
 # ---------------------------------------------------------------------
-# SIMULATED GPS THREAD -- replaces real NEO-6M / gpsd while hardware is down
-# Random walk around SIM_BASE_LAT / SIM_BASE_LON, stays within site radius.
-# ---------------------------------------------------------------------
-def sim_gps_thread():
-    METERS_PER_DEG_LAT = 111_111.0
-    METERS_PER_DEG_LON = 111_111.0 * math.cos(math.radians(SIM_BASE_LAT))
-
-    lat = SIM_BASE_LAT
-    lon = SIM_BASE_LON
-    alt = SIM_BASE_ALT
-    heading = random.uniform(0, 360)
-    speed = 0.0
-    has_fix = False
-    last = time.time()
-
-    # warm-up: pretend we're acquiring fix for a few seconds
-    print("[GPS-SIM] Warming up (simulating fix acquisition)...")
-    time.sleep(3.0)
-    has_fix = True
-    print(f"[GPS-SIM] 3D fix acquired at {SIM_BASE_LAT:.4f}, {SIM_BASE_LON:.4f}")
-
-    while not stop_event.is_set():
-        now = time.time()
-        dt  = now - last
-        last = now
-
-        # heading drift (worker turns occasionally)
-        heading = (heading + random.gauss(0, 15) * dt) % 360
-
-        # speed wobbles around walking pace, sometimes pauses
-        target_speed = SIM_WALK_SPEED if random.random() > 0.1 else 0.0
-        speed += (target_speed - speed) * 0.3
-        speed = max(0.0, min(speed, 2.0))
-
-        # convert heading + speed to lat/lon delta
-        dist_m = speed * dt
-        dlat_m = dist_m * math.cos(math.radians(heading))
-        dlon_m = dist_m * math.sin(math.radians(heading))
-
-        new_lat = lat + dlat_m / METERS_PER_DEG_LAT
-        new_lon = lon + dlon_m / METERS_PER_DEG_LON
-
-        # stay inside the site -- if we'd leave, reverse heading
-        dlat_from_base = (new_lat - SIM_BASE_LAT) * METERS_PER_DEG_LAT
-        dlon_from_base = (new_lon - SIM_BASE_LON) * METERS_PER_DEG_LON
-        dist_from_base = math.sqrt(dlat_from_base**2 + dlon_from_base**2)
-
-        if dist_from_base > SIM_SITE_RADIUS_M:
-            # turn back toward base
-            heading = math.degrees(math.atan2(
-                (SIM_BASE_LON - lon) * METERS_PER_DEG_LON,
-                (SIM_BASE_LAT - lat) * METERS_PER_DEG_LAT
-            )) % 360
-        else:
-            lat = new_lat
-            lon = new_lon
-
-        # altitude wobble
-        alt = max(SIM_BASE_ALT - 5, min(SIM_BASE_ALT + 5, alt + random.gauss(0, 0.3)))
-
-        # very rare brief fix loss
-        has_fix = random.random() > 0.002
-
-        with state_lock:
-            if has_fix:
-                state["lat"] = round(lat, 6)
-                state["lon"] = round(lon, 6)
-                state["alt"] = round(alt, 1)
-            else:
-                state["lat"] = "No Fix"
-                state["lon"] = "No Fix"
-                state["alt"] = "No Fix"
-
-        time.sleep(1.0 / SIM_UPDATE_HZ)
-
-# ---------------------------------------------------------------------
 # CAMERA + YOLO THREAD
 # ---------------------------------------------------------------------
 def camera_thread():
     global latest_jpeg
 
-    cam = Picamera2()
-    cfg = cam.create_preview_configuration(
-        main={"size": (CAM_W, CAM_H), "format": "RGB888"},
-        controls={"FrameRate": 30}
-    )
-    cam.configure(cfg)
-    cam.start()
-    time.sleep(0.8)
-    print(f"[CAMERA] Ready ({CAM_W}x{CAM_H})")
+    try:
+        cam = Picamera2()
+        cfg = cam.create_preview_configuration(
+            main={"size": (CAM_W, CAM_H), "format": "RGB888"},
+            controls={"FrameRate": 30}
+        )
+        cam.configure(cfg)
+        cam.start()
+        time.sleep(0.8)
+        print(f"[CAMERA] Ready ({CAM_W}x{CAM_H})")
+    except Exception as e:
+        print(f"[CAMERA ERROR] Could not init camera: {e}")
+        return
 
-    model = YOLO(MODEL_PATH)
+    try:
+        model = YOLO(MODEL_PATH)
+    except Exception as e:
+        print(f"[YOLO ERROR] Could not load model: {e}")
+        return
+        
     font  = cv2.FONT_HERSHEY_SIMPLEX
     fps   = 0.0
     fc    = 0
@@ -451,48 +855,53 @@ def camera_thread():
 
     try:
         while not stop_event.is_set():
-            rgb   = cam.capture_array()
-            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            try:
+                rgb   = cam.capture_array()
+                frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            results = model.predict(
-                source=frame, conf=CONF, iou=IOU,
-                imgsz=IMGSZ, verbose=False
-            )
+                results = model.predict(
+                    source=frame, conf=CONF, iou=IOU,
+                    imgsz=IMGSZ, verbose=False
+                )
 
-            tags = []
-            for box in results[0].boxes:
-                cls_id     = int(box.cls[0])
-                confidence = float(box.conf[0])
-                label      = f"{model.names[cls_id]} {confidence:.2f}"
-                x1,y1,x2,y2 = map(int, box.xyxy[0])
-                tags.append(f"{model.names[cls_id]}({confidence:.2f})")
-                cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
-                (tw,th),_ = cv2.getTextSize(label, font, 0.5, 1)
-                cv2.rectangle(frame,(x1,y1-th-6),(x1+tw+4,y1),(0,200,0),-1)
-                cv2.putText(frame, label,(x1+2,y1-4),font,0.5,(0,0,0),1,cv2.LINE_AA)
+                tags = []
+                for box in results[0].boxes:
+                    cls_id     = int(box.cls[0])
+                    confidence = float(box.conf[0])
+                    label      = f"{model.names[cls_id]} {confidence:.2f}"
+                    x1,y1,x2,y2 = map(int, box.xyxy[0])
+                    tags.append(f"{model.names[cls_id]}({confidence:.2f})")
+                    cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
+                    (tw,th),_ = cv2.getTextSize(label, font, 0.5, 1)
+                    cv2.rectangle(frame,(x1,y1-th-6),(x1+tw+4,y1),(0,200,0),-1)
+                    cv2.putText(frame, label,(x1+2,y1-4),font,0.5,(0,0,0),1,cv2.LINE_AA)
 
-            fc += 1
-            if fc % 10 == 0:
-                fps   = 10.0 / (time.time() - t_ref + 1e-6)
-                t_ref = time.time()
-                fc    = 0
+                fc += 1
+                if fc % 10 == 0:
+                    elapsed = time.time() - t_ref
+                    if elapsed > 0:
+                        fps = 10.0 / elapsed
+                    t_ref = time.time()
+                    fc    = 0
 
-            cv2.putText(frame, f"FPS:{fps:.1f}", (8,24),
-                        font, 0.7, (0,255,255), 2, cv2.LINE_AA)
+                cv2.putText(frame, f"FPS:{fps:.1f}", (8,24),
+                            font, 0.7, (0,255,255), 2, cv2.LINE_AA)
 
-            with state_lock:
-                state["detections"] = tags
-                state["fps"]        = round(fps, 1)
+                with state_lock:
+                    state["detections"] = tags
+                    state["fps"]        = round(fps, 1)
 
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            if ok:
-                with frame_lock:
-                    latest_jpeg = buf.tobytes()
-
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    with frame_lock:
+                        latest_jpeg = buf.tobytes()
+                            
+            except Exception as e:
+                print(f"[CAMERA ERROR] Frame capture error: {e}")
+                time.sleep(0.1)
     finally:
         cam.stop()
         print("[CAMERA] Stopped.")
-
 # ---------------------------------------------------------------------
 # FLASK APP
 # ---------------------------------------------------------------------
@@ -721,7 +1130,7 @@ DASHBOARD_HTML = """
 
   <!-- GPS Panel -->
   <div class="panel">
-    <div class="panel-label">// GPS &mdash; NEO-6M (SIM)</div>
+    <div class="panel-label">// GPS &mdash; NEO-6M</div>
     <div class="gps-row">
       <div class="gps-key">LATITUDE</div>
       <div class="gps-val" id="gps-lat">Acquiring...</div>
@@ -739,7 +1148,7 @@ DASHBOARD_HTML = """
 
   <!-- Heart Rate Panel -->
   <div class="panel">
-    <div class="panel-label">// HEART RATE &mdash; PULSE SENSOR</div>
+    <div class="panel-label">// HEART RATE &mdash; MAX30102</div>
     <div class="hr-main">
       <span class="hr-beat">&#10084;</span>&nbsp;
       <div class="hr-big" id="hr-big">--</div>
@@ -946,6 +1355,9 @@ DASHBOARD_HTML = """
 </html>
 """
 
+# ---------------------------------------------------------------------
+# FLASK ROUTES
+# ---------------------------------------------------------------------
 @app.route("/")
 def index():
     return render_template_string(DASHBOARD_HTML)
@@ -969,6 +1381,13 @@ def acknowledge_temp():
     print("[ACK] Temp alert acknowledged.")
     return jsonify({"status": "cleared"})
 
+@app.route("/api/acknowledge_hr", methods=["POST"])
+def acknowledge_hr():
+    with state_lock:
+        state["hr_alert"] = False
+    print("[ACK] HR alert acknowledged.")
+    return jsonify({"status": "cleared"})
+
 def mjpeg_generator():
     global latest_jpeg
     while True:
@@ -977,13 +1396,6 @@ def mjpeg_generator():
         if frame:
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
         time.sleep(0.03)
-
-@app.route("/api/acknowledge_hr", methods=["POST"])
-def acknowledge_hr():
-    with state_lock:
-        state["hr_alert"] = False
-    print("[ACK] HR alert acknowledged.")
-    return jsonify({"status": "cleared"})
 
 @app.route("/video_feed")
 def video_feed():
@@ -996,7 +1408,7 @@ def video_feed():
 if __name__ == "__main__":
     threads = [
         threading.Thread(target=imu_thread,            daemon=True, name="IMU"),
-        threading.Thread(target=sim_gps_thread,        daemon=True, name="GPS-SIM"),
+        threading.Thread(target=gps_thread,            daemon=True, name="GPS"),
         threading.Thread(target=camera_thread,         daemon=True, name="CAM"),
         threading.Thread(target=temp_thread,           daemon=True, name="TEMP"),
         threading.Thread(target=hr_thread,             daemon=True, name="HR"),
