@@ -1,0 +1,101 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+const char* serverUrl = "http://172.20.10.9:5000/data";
+
+Adafruit_MPU6050 mpu;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(21, 22);
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("MPU6050 connected!");
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  sensors_event_t accel;
+  sensors_event_t gyro;
+  sensors_event_t temp;
+
+  mpu.getEvent(&accel, &gyro, &temp);
+
+  // Adafruit library acceleration is m/s^2
+  float ax = accel.acceleration.x / 9.80665;
+  float ay = accel.acceleration.y / 9.80665;
+  float az = accel.acceleration.z / 9.80665;
+
+  // Convert gyro rad/s to deg/s
+  float gx = gyro.gyro.x * 180.0 / PI;
+  float gy = gyro.gyro.y * 180.0 / PI;
+  float gz = gyro.gyro.z * 180.0 / PI;
+
+  float temperature = temp.temperature;
+
+  String json = "{";
+  json += "\"ax\":" + String(ax, 4) + ",";
+  json += "\"ay\":" + String(ay, 4) + ",";
+  json += "\"az\":" + String(az, 4) + ",";
+  json += "\"gx\":" + String(gx, 4) + ",";
+  json += "\"gy\":" + String(gy, 4) + ",";
+  json += "\"gz\":" + String(gz, 4) + ",";
+  json += "\"mx\":0,";
+  json += "\"my\":0,";
+  json += "\"mz\":0,";
+  json += "\"temp\":" + String(temperature, 2);
+  json += "}";
+
+  Serial.println(json);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    int responseCode = http.POST(json);
+
+    Serial.print("HTTP response: ");
+    Serial.println(responseCode);
+
+    if (responseCode > 0) {
+      Serial.println(http.getString());
+    }
+
+    http.end();
+  }
+
+  delay(500);
+}
