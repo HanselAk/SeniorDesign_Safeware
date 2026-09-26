@@ -1,0 +1,67 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+const char* serverUrl = "http://172.20.10.9:5000/data";
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    HTTPClient http;
+
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    // Temporary fake MPU readings
+    String json =
+      "{"
+      "\"ax\":0.01,"
+      "\"ay\":0.02,"
+      "\"az\":1.00,"
+      "\"gx\":0.50,"
+      "\"gy\":0.20,"
+      "\"gz\":0.10,"
+      "\"mx\":25.0,"
+      "\"my\":12.0,"
+      "\"mz\":-7.0,"
+      "\"temp\":26.4"
+      "}";
+
+    int responseCode = http.POST(json);
+
+    Serial.print("HTTP response: ");
+    Serial.println(responseCode);
+
+    if (responseCode > 0) {
+      Serial.println(http.getString());
+    }
+
+    http.end();
+
+  } else {
+    Serial.println("WiFi disconnected");
+  }
+
+  delay(1000);
+}
