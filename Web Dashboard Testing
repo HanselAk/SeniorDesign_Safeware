@@ -1,0 +1,918 @@
+
+import math
+import random
+import time
+import threading
+from collections import deque
+import cv2
+import smbus2
+import smtplib
+from email.mime.text import MIMEText
+import RPi.GPIO as GPIO
+from flask import Flask, Response, jsonify, render_template
+from mpu6050 import mpu6050
+from ultralytics import YOLO
+from picamera2 import Picamera2
+
+# ---------------------------------------------------------------------
+# EMAIL CONFIG -- loaded from ~/email_config.py on the Pi
+# ---------------------------------------------------------------------
+try:
+    from email_config import EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER
+except ImportError:
+    EMAIL_SENDER = EMAIL_PASSWORD = EMAIL_RECEIVER = None
+    print("[EMAIL] email_config.py not found -- email alerts disabled.")
+
+# ---------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------
+MODEL_PATH        = "yolov8n.pt"
+CONF              = 0.45
+IOU               = 0.45
+IMGSZ             = 256
+CAM_W, CAM_H      = 480, 360
+FREE_FALL_THRESH  = 3.0
+IMPACT_THRESH     = 20.0
+IMPACT_WINDOW     = 1.5
+SAMPLE_RATE       = 0.02
+MAX_ALERTS        = 20
+TEMP_ALERT_F      = 103.0    # F threshold for heat alert
+HR_ALERT_BPM      = 120       # BPM threshold for tachycardia alert
+HR_SAMPLE_WINDOW  = 10        # seconds of samples to average BPM over
+
+# --- GPS simulator config ---
+SIM_BASE_LAT      = 33.9526   # Marietta, GA
+SIM_BASE_LON      = -84.5499
+SIM_BASE_ALT      = 310.0     # meters
+SIM_SITE_RADIUS_M = 80        # keep worker within this radius
+SIM_WALK_SPEED    = 1.2       # m/s (walking pace)
+SIM_UPDATE_HZ     = 1.0       # GPS-style 1 Hz
+
+# GPIO pins
+PIN_BUZZER  = 17
+PIN_LED     = 27
+PIN_TOUCH   = 23
+
+# MLX90614 I2C
+MLX_ADDR      = 0x5A
+MLX_RAM_TOBJ1 = 0x07   # object temperature register
+
+# ---------------------------------------------------------------------
+# GPIO SETUP
+# ---------------------------------------------------------------------
+def gpio_init():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(PIN_BUZZER, GPIO.OUT)
+    GPIO.setup(PIN_LED,    GPIO.OUT)
+    GPIO.setup(PIN_TOUCH,  GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+gpio_init()
+buzzer_pwm = GPIO.PWM(PIN_BUZZER, 1000)
+
+# ---------------------------------------------------------------------
+# SHARED STATE
+# ---------------------------------------------------------------------
+state_lock = threading.Lock()
+state = {
+    "ax": 0.0, "ay": 0.0, "az": 0.0, "smv": 0.0,
+    "lat": "No Fix", "lon": "No Fix", "alt": "No Fix",
+    "fall": False,
+    "fall_active": False,
+    "helmet_on": False,
+    # Change this to a real sensor reading when the vest-closure input is added.
+    "vest_on": None,
+    "temp_f": 0.0,
+    "temp_c": 0.0,
+    "temp_alert": False,
+    "alerts": [],
+    "temp_alerts": [],
+    "hr_bpm": 0,
+    "hr_alert": False,
+    "hr_alerts": [],
+    "detections": [],
+    "fps": 0.0,
+}
+
+frame_lock = threading.Lock()
+latest_jpeg = None
+
+# NEW: raw camera frame shared with YOLO
+camera_frame_lock = threading.Lock()
+latest_frame = None
+
+# NEW: YOLO results shared with camera
+detection_lock = threading.Lock()
+latest_boxes = []
+
+stop_event = threading.Event()
+
+temp_history = deque(maxlen=60)
+hr_history = deque(maxlen=60)
+
+
+
+# ---------------------------------------------------------------------
+# EMAIL ALERT FUNCTION
+# ---------------------------------------------------------------------
+def send_email(subject, body):
+    if not EMAIL_SENDER:
+        return
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = EMAIL_RECEIVER
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        print("[EMAIL] Alert sent successfully.")
+    except Exception as e:
+        print(f"[EMAIL ERROR] {e}")
+
+# ---------------------------------------------------------------------
+# MLX90614 TEMPERATURE THREAD
+# ---------------------------------------------------------------------
+def read_mlx90614(bus):
+    raw    = bus.read_word_data(MLX_ADDR, MLX_RAM_TOBJ1)
+    temp_k = raw * 0.02
+    temp_c = temp_k - 273.15
+    return temp_c
+
+def temp_thread():
+    try:
+        bus = smbus2.SMBus(1)
+    except Exception as e:
+        print(f"[TEMP ERROR] Could not open I2C bus: {e}")
+        return
+
+    while not stop_event.is_set():
+        try:
+            temp_c = read_mlx90614(bus)
+            temp_f = temp_c * 9.0 / 5.0 + 32.0
+
+            with state_lock:
+                state["temp_c"] = round(temp_c, 1)
+                state["temp_f"] = round(temp_f, 1)
+
+                if temp_f >= TEMP_ALERT_F and not state["temp_alert"]:
+                    state["temp_alert"] = True
+                    alert = {
+                        "time":   time.strftime("%H:%M:%S"),
+                        "temp_f": round(temp_f, 1),
+                        "temp_c": round(temp_c, 1),
+                        "lat":    state["lat"],
+                        "lon":    state["lon"],
+                    }
+                    state["temp_alerts"].insert(0, alert)
+                    if len(state["temp_alerts"]) > MAX_ALERTS:
+                        state["temp_alerts"].pop()
+                    tf_snap = round(temp_f, 1)
+                    tc_snap = round(temp_c, 1)
+                    lat_snap2 = state["lat"]
+                    lon_snap2 = state["lon"]
+                    print(f"[TEMP ALERT] {temp_f:.1f}F exceeds threshold!")
+                    t2 = threading.Thread(target=send_email, daemon=True, args=(
+                        "HIGH TEMP ALERT -- Worker Overheating",
+                        f"Worker temperature exceeded 103F.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nTemp: {tf_snap}F / {tc_snap}C\nLat: {lat_snap2}\nLon: {lon_snap2}\n\nDashboard: http://192.168.1.212:5000"
+                    ))
+                    t2.start()
+
+        except Exception as e:
+            print(f"[TEMP ERROR] {e}")
+
+        time.sleep(1.0)
+
+
+# ---------------------------------------------------------------------
+# HEART RATE THREAD -- MCP3008 + analog pulse sensor on CH0
+# ---------------------------------------------------------------------
+def hr_thread():
+    try:
+        import spidev
+        spi = spidev.SpiDev()
+        spi.open(0, 0)
+        spi.max_speed_hz = 1350000
+        spi.mode = 0
+    except Exception as e:
+        print(f"[HR ERROR] Could not init MCP3008 SPI: {e}")
+        return
+
+    def read_mcp3008(channel=0):
+        r = spi.xfer2([1, (8 + channel) << 4, 0])
+        return ((r[1] & 3) << 8) | r[2]
+
+    print("[HR] Heart rate sensor ready on MCP3008 CH0")
+
+    peak_times = []
+    last_val   = 0
+    rising     = False
+    threshold  = 512
+
+    while not stop_event.is_set():
+        try:
+            val = read_mcp3008(0)
+
+            if not rising and val > threshold and last_val <= threshold:
+                rising = True
+                now = time.time()
+                peak_times.append(now)
+                peak_times = [t for t in peak_times if now - t <= HR_SAMPLE_WINDOW]
+
+            elif rising and val < threshold:
+                rising = False
+
+            last_val = val
+
+            bpm = 0
+            if len(peak_times) >= 2:
+                intervals = [peak_times[i+1] - peak_times[i]
+                             for i in range(len(peak_times)-1)]
+                avg_interval = sum(intervals) / len(intervals)
+                if avg_interval > 0:
+                    bpm = int(60.0 / avg_interval)
+
+            with state_lock:
+                state["hr_bpm"] = bpm
+
+                if bpm >= HR_ALERT_BPM and not state["hr_alert"]:
+                    state["hr_alert"] = True
+                    alert = {
+                        "time":  time.strftime("%H:%M:%S"),
+                        "bpm":   bpm,
+                        "lat":   state["lat"],
+                        "lon":   state["lon"],
+                    }
+                    state["hr_alerts"].insert(0, alert)
+                    if len(state["hr_alerts"]) > MAX_ALERTS:
+                        state["hr_alerts"].pop()
+                    print(f"[HR ALERT] {bpm} BPM exceeds threshold!")
+                    lat_s = state["lat"]
+                    lon_s = state["lon"]
+                    t_email = threading.Thread(target=send_email, daemon=True, args=(
+                        "HIGH HEART RATE ALERT -- Tachycardia Detected",
+                        f"Worker heart rate exceeded 120 BPM.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nBPM: {bpm}\nLat: {lat_s}\nLon: {lon_s}\n\nDashboard: http://192.168.1.212:5000"
+                    ))
+                    t_email.start()
+
+                elif bpm < HR_ALERT_BPM and state["hr_alert"] and bpm > 0:
+                    state["hr_alert"] = False
+
+        except Exception as e:
+            print(f"[HR ERROR] {e}")
+
+        time.sleep(0.02)
+
+# ---------------------------------------------------------------------
+# BUZZER + LED THREAD
+# ---------------------------------------------------------------------
+def alert_hardware_thread():
+    gpio_init()
+    buzzer_on = False
+    while not stop_event.is_set():
+        with state_lock:
+            active = state["fall_active"] or state["temp_alert"] or state["hr_alert"]
+
+        if active:
+            GPIO.output(PIN_LED, GPIO.HIGH)
+            if not buzzer_on:
+                buzzer_pwm.start(50)
+                buzzer_on = True
+            time.sleep(0.3)
+            GPIO.output(PIN_LED, GPIO.LOW)
+            time.sleep(0.3)
+        else:
+            if buzzer_on:
+                buzzer_pwm.stop()
+                buzzer_on = False
+            GPIO.output(PIN_LED,    GPIO.LOW)
+            GPIO.output(PIN_BUZZER, GPIO.LOW)
+            time.sleep(0.1)
+
+# ---------------------------------------------------------------------
+# TOUCH SENSOR THREAD
+# ---------------------------------------------------------------------
+def touch_thread():
+    gpio_init()
+    while not stop_event.is_set():
+        reading = GPIO.input(PIN_TOUCH)
+        with state_lock:
+            state["helmet_on"] = bool(reading)
+        time.sleep(0.1)
+
+# ---------------------------------------------------------------------
+# IMU + FALL DETECTION THREAD
+# ---------------------------------------------------------------------
+def imu_thread():
+    sensor = mpu6050(0x68)
+    in_freefall   = False
+    freefall_time = None
+
+    while not stop_event.is_set():
+        try:
+            a  = sensor.get_accel_data()
+            ax, ay, az = a["x"], a["y"], a["z"]
+            smv = math.sqrt(ax**2 + ay**2 + az**2)
+            fall_now = False
+
+            if not in_freefall and smv < FREE_FALL_THRESH:
+                in_freefall   = True
+                freefall_time = time.time()
+
+            elif in_freefall:
+                if smv > IMPACT_THRESH:
+                    fall_now    = True
+                    in_freefall = False
+                    with state_lock:
+                        alert = {
+                            "time": time.strftime("%H:%M:%S"),
+                            "lat":  state["lat"],
+                            "lon":  state["lon"],
+                            "smv":  round(smv, 2),
+                        }
+                        state["alerts"].insert(0, alert)
+                        if len(state["alerts"]) > MAX_ALERTS:
+                            state["alerts"].pop()
+                        state["fall_active"] = True
+                        lat_snap = state["lat"]
+                        lon_snap = state["lon"]
+                        smv_snap = round(smv, 2)
+                    t = threading.Thread(target=send_email, daemon=True, args=(
+                        "FALL DETECTED -- Worker Down",
+                        f"A fall was detected.\n\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nSMV: {smv_snap} m/s^2\nLat: {lat_snap}\nLon: {lon_snap}\n\nDashboard: http://192.168.1.212:5000"
+                    ))
+                    t.start()
+                elif time.time() - freefall_time > IMPACT_WINDOW:
+                    in_freefall = False
+
+            with state_lock:
+                state["ax"]   = round(ax, 3)
+                state["ay"]   = round(ay, 3)
+                state["az"]   = round(az, 3)
+                state["smv"]  = round(smv, 3)
+                state["fall"] = fall_now
+
+        except Exception as e:
+            print(f"[IMU ERROR] {e}")
+
+        time.sleep(SAMPLE_RATE)
+
+# ---------------------------------------------------------------------
+# SIMULATED GPS THREAD -- replaces real NEO-6M / gpsd while hardware is down
+# Random walk around SIM_BASE_LAT / SIM_BASE_LON, stays within site radius.
+# ---------------------------------------------------------------------
+def sim_gps_thread():
+    METERS_PER_DEG_LAT = 111_111.0
+    METERS_PER_DEG_LON = 111_111.0 * math.cos(math.radians(SIM_BASE_LAT))
+
+    lat = SIM_BASE_LAT
+    lon = SIM_BASE_LON
+    alt = SIM_BASE_ALT
+    heading = random.uniform(0, 360)
+    speed = 0.0
+    has_fix = False
+    last = time.time()
+
+    # warm-up: pretend we're acquiring fix for a few seconds
+    print("[GPS-SIM] Warming up (simulating fix acquisition)...")
+    time.sleep(3.0)
+    has_fix = True
+    print(f"[GPS-SIM] 3D fix acquired at {SIM_BASE_LAT:.4f}, {SIM_BASE_LON:.4f}")
+
+    while not stop_event.is_set():
+        now = time.time()
+        dt  = now - last
+        last = now
+
+        # heading drift (worker turns occasionally)
+        heading = (heading + random.gauss(0, 15) * dt) % 360
+
+        # speed wobbles around walking pace, sometimes pauses
+        target_speed = SIM_WALK_SPEED if random.random() > 0.1 else 0.0
+        speed += (target_speed - speed) * 0.3
+        speed = max(0.0, min(speed, 2.0))
+
+        # convert heading + speed to lat/lon delta
+        dist_m = speed * dt
+        dlat_m = dist_m * math.cos(math.radians(heading))
+        dlon_m = dist_m * math.sin(math.radians(heading))
+
+        new_lat = lat + dlat_m / METERS_PER_DEG_LAT
+        new_lon = lon + dlon_m / METERS_PER_DEG_LON
+
+        # stay inside the site -- if we'd leave, reverse heading
+        dlat_from_base = (new_lat - SIM_BASE_LAT) * METERS_PER_DEG_LAT
+        dlon_from_base = (new_lon - SIM_BASE_LON) * METERS_PER_DEG_LON
+        dist_from_base = math.sqrt(dlat_from_base**2 + dlon_from_base**2)
+
+        if dist_from_base > SIM_SITE_RADIUS_M:
+            # turn back toward base
+            heading = math.degrees(math.atan2(
+                (SIM_BASE_LON - lon) * METERS_PER_DEG_LON,
+                (SIM_BASE_LAT - lat) * METERS_PER_DEG_LAT
+            )) % 360
+        else:
+            lat = new_lat
+            lon = new_lon
+
+        # altitude wobble
+        alt = max(SIM_BASE_ALT - 5, min(SIM_BASE_ALT + 5, alt + random.gauss(0, 0.3)))
+
+        # very rare brief fix loss
+        has_fix = random.random() > 0.002
+
+        with state_lock:
+            if has_fix:
+                state["lat"] = round(lat, 6)
+                state["lon"] = round(lon, 6)
+                state["alt"] = round(alt, 1)
+            else:
+                state["lat"] = "No Fix"
+                state["lon"] = "No Fix"
+                state["alt"] = "No Fix"
+
+        time.sleep(1.0 / SIM_UPDATE_HZ)
+
+# ---------------------------------------------------------------------
+# CAMERA + YOLO THREAD
+# ---------------------------------------------------------------------
+def camera_thread():
+    global latest_jpeg
+    global latest_frame
+
+    cam = Picamera2()
+
+    cfg = cam.create_preview_configuration(
+        main={
+            "size": (CAM_W, CAM_H),
+            "format": "RGB888"
+        },
+        controls={
+            "FrameRate": 30
+        }
+    )
+
+    cam.configure(cfg)
+    cam.start()
+
+    time.sleep(0.8)
+
+    print(f"[CAMERA] Ready ({CAM_W}x{CAM_H})")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Camera FPS calculation
+    fps = 0.0
+    fc = 0
+    t_ref = time.time()
+
+    try:
+
+        while not stop_event.is_set():
+
+            # ---------------------------------------------------------
+            # CAPTURE CAMERA FRAME
+            # ---------------------------------------------------------
+
+            rgb = cam.capture_array()
+
+            frame = cv2.cvtColor(
+                rgb,
+                cv2.COLOR_RGB2BGR
+            )
+
+            # ---------------------------------------------------------
+            # GIVE NEWEST FRAME TO YOLO THREAD
+            # ---------------------------------------------------------
+
+            with camera_frame_lock:
+                latest_frame = frame.copy()
+
+            # ---------------------------------------------------------
+            # GET MOST RECENT YOLO RESULTS
+            # ---------------------------------------------------------
+
+            with detection_lock:
+                boxes = list(latest_boxes)
+
+            # ---------------------------------------------------------
+            # DRAW YOLO BOXES
+            # ---------------------------------------------------------
+
+            for box in boxes:
+
+                x1, y1, x2, y2 = box["coords"]
+
+                label = box["label"]
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 0),
+                    2
+                )
+
+                (tw, th), _ = cv2.getTextSize(
+                    label,
+                    font,
+                    0.5,
+                    1
+                )
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1 - th - 6),
+                    (x1 + tw + 4, y1),
+                    (0, 200, 0),
+                    -1
+                )
+
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1 + 2, y1 - 4),
+                    font,
+                    0.5,
+                    (0, 0, 0),
+                    1,
+                    cv2.LINE_AA
+                )
+
+            # ---------------------------------------------------------
+            # CALCULATE CAMERA / STREAM FPS
+            # ---------------------------------------------------------
+
+            fc += 1
+
+            if fc >= 30:
+
+                elapsed = time.time() - t_ref
+
+                if elapsed > 0:
+                    fps = fc / elapsed
+
+                t_ref = time.time()
+                fc = 0
+
+            cv2.putText(
+                frame,
+                f"STREAM FPS: {fps:.1f}",
+                (8, 24),
+                font,
+                0.7,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+            # ---------------------------------------------------------
+            # UPDATE DASHBOARD STATE
+            # ---------------------------------------------------------
+
+            with state_lock:
+                state["fps"] = round(fps, 1)
+
+            # ---------------------------------------------------------
+            # JPEG ENCODE FOR WEB DASHBOARD
+            # ---------------------------------------------------------
+
+            ok, buf = cv2.imencode(
+                ".jpg",
+                frame,
+                [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    60
+                ]
+            )
+
+            if ok:
+
+                with frame_lock:
+                    latest_jpeg = buf.tobytes()
+
+    finally:
+
+        cam.stop()
+
+        print("[CAMERA] Stopped.")
+
+def yolo_thread():
+
+    global latest_boxes
+
+    print("[YOLO] Loading model...")
+
+    model = YOLO(MODEL_PATH)
+
+    print("[YOLO] Model loaded.")
+
+    while not stop_event.is_set():
+
+        # ---------------------------------------------------------
+        # GET NEWEST CAMERA FRAME
+        # ---------------------------------------------------------
+
+        with camera_frame_lock:
+
+            if latest_frame is None:
+                frame = None
+            else:
+                frame = latest_frame.copy()
+
+        if frame is None:
+
+            time.sleep(0.01)
+
+            continue
+
+        # ---------------------------------------------------------
+        # RUN YOLO
+        # ---------------------------------------------------------
+
+        yolo_start = time.time()
+
+        try:
+
+            results = model.predict(
+                source=frame,
+                conf=CONF,
+                iou=IOU,
+                imgsz=IMGSZ,
+                verbose=False
+            )
+
+        except Exception as e:
+
+            print(f"[YOLO ERROR] {e}")
+
+            time.sleep(0.1)
+
+            continue
+
+        yolo_time = time.time() - yolo_start
+
+        if yolo_time > 0:
+            yolo_fps = 1.0 / yolo_time
+        else:
+            yolo_fps = 0.0
+
+        # ---------------------------------------------------------
+        # PROCESS DETECTIONS
+        # ---------------------------------------------------------
+
+        boxes_new = []
+
+        tags = []
+
+        for box in results[0].boxes:
+
+            cls_id = int(box.cls[0])
+
+            confidence = float(box.conf[0])
+
+            x1, y1, x2, y2 = map(
+                int,
+                box.xyxy[0]
+            )
+
+            class_name = model.names[cls_id]
+
+            label = (
+                f"{class_name} "
+                f"{confidence:.2f}"
+            )
+
+            boxes_new.append({
+                "coords": (
+                    x1,
+                    y1,
+                    x2,
+                    y2
+                ),
+                "label": label
+            })
+
+            tags.append(
+                f"{class_name}"
+                f"({confidence:.2f})"
+            )
+
+        # ---------------------------------------------------------
+        # SAVE LATEST YOLO RESULTS
+        # ---------------------------------------------------------
+
+        with detection_lock:
+            latest_boxes = boxes_new
+
+        with state_lock:
+            state["detections"] = tags
+
+        print(
+            f"[YOLO] "
+            f"{yolo_fps:.1f} FPS | "
+            f"{len(boxes_new)} detections"
+        )
+
+        # Optional:
+        # Prevent YOLO from constantly taking all CPU/GPU resources.
+        #
+        # 0.05 = max ~20 detection attempts/sec
+        #
+        time.sleep(0.05)
+
+# ---------------------------------------------------------------------
+# FLASK APP
+# ---------------------------------------------------------------------
+app = Flask(__name__)
+
+
+def build_recent_alerts():
+    """Combine the three hardware alert logs for the new dashboard."""
+    combined = []
+
+    for alert in state["alerts"]:
+        combined.append({
+            "type": "FALL",
+            "message": f"Fall detected - impact {alert['smv']} m/sÂ²",
+            "severity": "critical",
+            "time": alert["time"],
+            "lat": alert["lat"],
+            "lon": alert["lon"],
+        })
+
+    for alert in state["temp_alerts"]:
+        combined.append({
+            "type": "HEAT",
+            "message": f"High temperature - {alert['temp_f']} Â°F",
+            "severity": "critical",
+            "time": alert["time"],
+            "lat": alert["lat"],
+            "lon": alert["lon"],
+        })
+
+    for alert in state["hr_alerts"]:
+        combined.append({
+            "type": "HEART RATE",
+            "message": f"High heart rate - {alert['bpm']} BPM",
+            "severity": "critical",
+            "time": alert["time"],
+            "lat": alert["lat"],
+            "lon": alert["lon"],
+        })
+
+    return sorted(combined, key=lambda item: item["time"], reverse=True)[:MAX_ALERTS]
+
+
+@app.route("/")
+def index():
+    return render_template("dashboard.html")
+
+@app.route("/api/state")
+def api_state():
+    with state_lock:
+        if state["temp_f"] > 0:
+            temp_history.append(state["temp_f"])
+        if state["hr_bpm"] > 0:
+            hr_history.append(state["hr_bpm"])
+
+        snapshot = dict(state)
+        snapshot["temp_history"] = list(temp_history)
+        snapshot["hr_history"] = list(hr_history)
+        snapshot["recent_alerts"] = build_recent_alerts()
+        snapshot["connected"] = True
+
+        if state["fall_active"] or state["temp_alert"] or state["hr_alert"]:
+            snapshot["overall_status"] = "EMERGENCY"
+        elif state["helmet_on"] is False or state["vest_on"] is False:
+            snapshot["overall_status"] = "WARNING"
+        else:
+            snapshot["overall_status"] = "SAFE"
+
+        return jsonify(snapshot)
+
+@app.route("/api/acknowledge_fall", methods=["POST"])
+def acknowledge_fall():
+    with state_lock:
+        state["fall_active"] = False
+    print("[ACK] Fall acknowledged.")
+    return jsonify({"status": "cleared"})
+
+@app.route("/api/acknowledge_temp", methods=["POST"])
+def acknowledge_temp():
+    with state_lock:
+        state["temp_alert"] = False
+    print("[ACK] Temp alert acknowledged.")
+    return jsonify({"status": "cleared"})
+
+def mjpeg_generator():
+    global latest_jpeg
+    while True:
+        with frame_lock:
+            frame = latest_jpeg
+        if frame:
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+        time.sleep(0.03)
+
+@app.route("/api/acknowledge_hr", methods=["POST"])
+def acknowledge_hr():
+    with state_lock:
+        state["hr_alert"] = False
+    print("[ACK] HR alert acknowledged.")
+    return jsonify({"status": "cleared"})
+
+
+@app.route("/api/acknowledge/all", methods=["POST"])
+def acknowledge_all():
+    with state_lock:
+        state["fall_active"] = False
+        state["temp_alert"] = False
+        state["hr_alert"] = False
+    print("[ACK] All active alerts acknowledged.")
+    return jsonify({"status": "cleared"})
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(mjpeg_generator(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ---------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    threads = [
+
+    threading.Thread(
+        target=imu_thread,
+        daemon=True,
+        name="IMU"
+    ),
+
+    threading.Thread(
+        target=sim_gps_thread,
+        daemon=True,
+        name="GPS-SIM"
+    ),
+
+    # CAMERA STREAM
+    threading.Thread(
+        target=camera_thread,
+        daemon=True,
+        name="CAM"
+    ),
+
+    # NEW YOLO THREAD
+    threading.Thread(
+        target=yolo_thread,
+        daemon=True,
+        name="YOLO"
+    ),
+
+    threading.Thread(
+        target=temp_thread,
+        daemon=True,
+        name="TEMP"
+    ),
+
+    threading.Thread(
+        target=hr_thread,
+        daemon=True,
+        name="HR"
+    ),
+
+    threading.Thread(
+        target=alert_hardware_thread,
+        daemon=True,
+        name="ALERT"
+    ),
+
+    threading.Thread(
+        target=touch_thread,
+        daemon=True,
+        name="TOUCH"
+    ),
+]
+
+
+    for t in threads:
+        t.start()
+        print(f"[BOOT] {t.name} thread started")
+
+    print(f"\n[DASHBOARD] http://192.168.1.212:5000\n")
+
+    try:
+        app.run(host="0.0.0.0", port=5000, threaded=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        time.sleep(0.6)
+        try:
+            buzzer_pwm.stop()
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
+        print("\n[INFO] GPIO cleaned up. Shutdown.")
