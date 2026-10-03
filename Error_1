@@ -1,0 +1,16 @@
+C:/Users/hakro/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\hakro\AppData\Local\arduino\sketches\39C8591C4F4E9D1AE5024A28043CF9FA\core\core.a(chip-debug-report.cpp.o):(.literal._Z20printBeforeSetupInfov+0xc0): undefined reference to `ESP'
+C:/Users/hakro/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\hakro\AppData\Local\arduino\sketches\39C8591C4F4E9D1AE5024A28043CF9FA\core\core.a(chip-debug-report.cpp.o):(.literal._Z20printBeforeSetupInfov+0x170): undefined reference to `EspClass::getFlashFrequencyMHz()'
+C:/Users/hakro/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\hakro\AppData\Local\arduino\sketches\39C8591C4F4E9D1AE5024A28043CF9FA\core\core.a(chip-debug-report.cpp.o):(.literal._Z20printBeforeSetupInfov+0x174): undefined reference to `EspClass::getFlashSourceFrequencyMHz()'
+C:/Users/hakro/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\hakro\AppData\Local\arduino\sketches\39C8591C4F4E9D1AE5024A28043CF9FA\core\core.a(chip-debug-report.cpp.o):(.literal._Z20printBeforeSetupInfov+0x178): undefined reference to `EspClass::getFlashClockDivider()'
+C:/Users/hakro/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\hakro\AppData\Local\arduino\sketches\39C8591C4F4E9D1AE5024A28043CF9FA\core\core.a(chip-debug-report.cpp.o): in function `printBeforeSetupInfo()':
+C:\Users\hakro\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.12\cores\esp32/chip-debug-report.cpp:139:(.text._Z20printBeforeSetupInfov+0x24c): undefined reference to `EspClass::getFlashFrequencyMHz()'
+C:/Users/hakro/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\hakro\AppData\Local\arduino\sketches\39C8591C4F4E9D1AE5024A28043CF9FA\core\core.a(chip-debug-report.cpp.o): in function `printFlashInfo':
+C:\Users\hakro\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.12\cores\esp32/chip-debug-report.cpp:140:(.text._Z20printBeforeSetupInfov+0x256): undefined reference to `EspClass::getFlashSourceFrequencyMHz()'
+C:/Users/hakro/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: C:\Users\hakro\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.12\cores\esp32/chip-debug-report.cpp:140:(.text._Z20printBeforeSetupInfov+0x260): undefined reference to `EspClass::getFlashClockDivider()'
+collect2.exe: error: ld returned 1 exit status
+Multiple libraries were found for "WiFi.h"
+  Used: C:\Users\hakro\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.12\libraries\WiFi
+  Not used: C:\Users\hakro\OneDrive\Documents\Arduino\libraries\WiFiNINA
+exit status 1
+
+Compilation error: exit status 1
