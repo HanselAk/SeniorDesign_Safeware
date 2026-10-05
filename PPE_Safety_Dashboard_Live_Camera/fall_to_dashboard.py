@@ -1,6 +1,6 @@
 """Read ESP32 MPU6050 acceleration over USB; detect and log fall candidates.
 
-Run from the Jetson inside ppe_env while demo_dashboard.py is running.
+Run from the Jetson inside ppe_env while server_dashboard.py is running.
 Use --demo first to test the detector and dashboard without a sensor.
 """
 
@@ -65,7 +65,7 @@ def send_sample(row):
         with urllib.request.urlopen(req, timeout=2):
             pass
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError("Dashboard is unavailable. Start demo_dashboard.py first.") from exc
+        raise RuntimeError("Dashboard is unavailable. Start server_dashboard.py first.") from exc
 
 
 def samples_from_serial(port):
