@@ -92,7 +92,7 @@ def main():
                 with urllib.request.urlopen(request, timeout=3):
                     pass
             except (urllib.error.URLError, TimeoutError) as exc:
-                print(f"Dashboard unavailable ({exc}). Start demo_dashboard.py in another terminal.", flush=True)
+                print(f"Dashboard unavailable ({exc}). Start server_dashboard.py in another terminal.", flush=True)
         print(f"Camera stream ended (GStreamer exit code: {process.poll()}).", file=sys.stderr)
     except KeyboardInterrupt:
         print("Stopping camera.")
