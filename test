@@ -1,403 +1,255 @@
 // ============================================================
-//  MPU9250 PDR + Fall Detection
-//  Single-file version. Drop into main.cpp or a .ino sketch.
+//  esp32_safeware.ino  -  Safeware wearable, generic ESP32 + MPU9250
+//
+//  The ESP32 only collects data: it reads accel, gyro and magnetometer at
+//  100 Hz and streams the raw samples over WiFi to server_dashboard.py on the
+//  Jetson (POST /api/imu). Gyro calibration, heading, magnetometer fusion and
+//  calibration, step detection, position (PDR) and fall detection all run on
+//  the Jetson. The live map is at http://<jetson-ip>:5000/pdr
+//
+//  Wiring: VCC=3V3, GND=GND, SDA=GPIO21, SCL=GPIO22, AD0=GND (address 0x68).
+//  Libraries: only the ESP32 Arduino core (WiFi, HTTPClient, Wire).
+//
+//  Sensing runs in loop() on core 1, networking runs on core 0, so a slow
+//  HTTP request never makes the sensor miss samples. Samples wait in a ring
+//  buffer (about 5 s) and are only removed once the Jetson accepts them.
 // ============================================================
-#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <Wire.h>
-#include <math.h>
 
-// ---------------- Hardware ----------------
-#define SDA_PIN   21
-#define SCL_PIN   22
-#define MPU_ADDR  0x68
-#define MAG_ADDR  0x0C
+// ================= USER SETTINGS =================
+const char* WIFI_SSID  = "";
+const char* WIFI_PASS  = "";
+const char* SERVER_URL = "http://10.74.52.106:5000/api/imu";  // Jetson IP: run `hostname -I` on it
+const char* API_TOKEN  = "";             // must match SAFEWARE_TOKEN on the Jetson; empty = no token
+const char* DEVICE_ID  = "esp32-01";
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+const unsigned long SEND_MS = 100;       // 10 posts per second, ~10 samples each
+// =================================================
 
-// ---------------- PDR tuning ----------------
-static const float STEP_LEN       = 0.70f;
-static const float STEP_HI        = 0.12f;
-static const float STEP_LO        = -0.05f;
-static const unsigned long STEP_MIN_MS     = 280;
-static const unsigned long WALK_TIMEOUT_MS = 1500;
-static const int   CAL_SAMPLES    = 200;
+#define MPU 0x68
+#define MAG 0x0C
 
-// ---------------- Mag fusion tuning ----------------
-static const float K_MAG          = 0.5f;
-static const float B_TOL          = 0.20f;
-static const float DIP_TOL        = 10.0f;
-static const float MAX_TURN_RATE  = 90.0f;
-static const unsigned long MAGCAL_MS = 30000;
+// One 100 Hz reading. Accel in g, gyro in deg/s, mag in uT (sensor axes, uncalibrated).
+struct Sample {
+  uint32_t us;
+  float a[3], g[3], m[3];
+  bool hasMag;
+};
 
-// ---------------- Fall detection tuning ----------------
-static const float FALL_FF_G      = 0.55f;   // g, free-fall threshold
-static const float FALL_EXIT_G    = 0.80f;   // g, cancel free-fall above this
-static const float FALL_IMP_G     = 2.30f;   // g, impact spike
-static const float FALL_STILL_G   = 0.13f;   // g, stddev during observation
-static const unsigned long FALL_FF_MIN_MS   = 120;
-static const unsigned long FALL_IMP_WIN_MS  = 1200;
-static const unsigned long FALL_OBS_MS      = 2500;
-static const unsigned long FALL_COOLDOWN_MS = 8000;
+const uint32_t BUF_SIZE = 512;
+const uint32_t MAX_BATCH = 60;
+Sample buf[BUF_SIZE];
+volatile uint32_t head = 0, tail = 0;    // head: written by loop(), tail: advanced by netTask
+volatile uint32_t dropped = 0;           // samples lost because the buffer was full
+portMUX_TYPE bufMux = portMUX_INITIALIZER_UNLOCKED;
 
-// ============================================================
-//  I2C primitives
-// ============================================================
-static void wr(uint8_t a, uint8_t r, uint8_t v) {
-  Wire.beginTransmission(a); Wire.write(r); Wire.write(v); Wire.endTransmission();
+volatile bool imuOk = false, magOk = false;
+float asa[3] = {1, 1, 1};                // magnetometer factory sensitivity adjustment
+uint32_t bootId = 0;                     // lets the Jetson notice a reboot and recalibrate
+unsigned long lastUs = 0;
+
+// ---------------- I2C helpers ----------------
+void writeReg(uint8_t a, uint8_t r, uint8_t v) {
+  Wire.beginTransmission(a);
+  Wire.write(r);
+  Wire.write(v);
+  Wire.endTransmission();
 }
-static bool rd(uint8_t a, uint8_t r, uint8_t* b, uint8_t n) {
-  Wire.beginTransmission(a); Wire.write(r);
-  if (Wire.endTransmission(false)) return false;
-  if (Wire.requestFrom(a, n) != n) return false;
+
+bool readRegs(uint8_t a, uint8_t r, uint8_t *b, uint8_t n) {
+  Wire.beginTransmission(a);
+  Wire.write(r);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)a, (uint8_t)n) != n) return false;
   for (uint8_t i = 0; i < n; i++) b[i] = Wire.read();
   return true;
 }
 
-// ============================================================
-//  Module state
-// ============================================================
-static bool imuOk = false, mOk = false;
-
-// IMU / gravity / gyro bias
-static float gBias[3] = {0,0,0};
-static float grav[3]  = {0,0,1};
-
-// Magnetometer
-static float asa[3]   = {1,1,1};
-static float magV[3]  = {0,0,0};
-static bool  magFresh = false;
-static int   refAxis  = 0;
-static bool  refSet   = false;
-static float magRef = 0, bRef = 0, dipRef = 0;
-static int   mState = 0;
-static float bNow = 0, magHdg = 0;
-
-// Mag calibration
-static bool  mCal = false;
-static unsigned long mCalStart = 0;
-static float cmn[3], cmx[3];
-
-// PDR
-static float heading = 0, posX = 0, posY = 0, distance = 0;
-static unsigned long steps = 0;
-static bool  armed = true, walking = false;
-static float avFilt = 0, stillMs = 0;
-static unsigned long lastStepMs = 0;
-
-// Fall detection
-enum FallState : uint8_t { F_IDLE, F_FREEFALL, F_IMPACT, F_OBSERVE };
-static FallState fState = F_IDLE;
-static unsigned long fT = 0, fLastMs = 0, fCount = 0;
-static bool  fAlert = false;
-static int   fSev = 0;
-static float fMinG = 0, fMaxG = 0;
-static float obsSum = 0, obsSum2 = 0;
-static unsigned long obsN = 0;
-
-static unsigned long lastUs = 0;
-
-// ============================================================
-//  Helpers
-// ============================================================
-static float wrap360(float a){ a = fmodf(a,360.0f); if(a<0)a+=360.0f; return a; }
-static float wrap180(float a){ a = wrap360(a); if(a>180.0f)a-=360.0f; return a; }
-static float norm3(const float v[3]){ return sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); }
-
-// ============================================================
-//  Sensor init
-// ============================================================
-static bool initIMU() {
-  wr(MPU_ADDR, 0x6B, 0x80); delay(100);   // reset
-  wr(MPU_ADDR, 0x6B, 0x01); delay(50);    // wake
-  wr(MPU_ADDR, 0x1A, 0x03);               // gyro LPF ~41 Hz
-  wr(MPU_ADDR, 0x19, 0x09);               // 100 Hz
-  wr(MPU_ADDR, 0x1B, 0x08);               // gyro ±500 dps
-  wr(MPU_ADDR, 0x1C, 0x08);               // accel ±4 g
-  wr(MPU_ADDR, 0x1D, 0x03);               // accel LPF ~44 Hz
+// ---------------- Sensors ----------------
+bool initIMU() {
+  writeReg(MPU, 0x6B, 0x80); delay(100);  // reset
+  writeReg(MPU, 0x6B, 0x01); delay(50);   // wake
+  writeReg(MPU, 0x1A, 0x03);              // gyro low-pass ~41 Hz
+  writeReg(MPU, 0x19, 0x09);              // 100 Hz
+  writeReg(MPU, 0x1B, 0x08);              // gyro +/-500 dps
+  writeReg(MPU, 0x1C, 0x10);              // accel +/-8 g, so fall impacts do not clip
+  writeReg(MPU, 0x1D, 0x03);              // accel low-pass ~44 Hz
   uint8_t who = 0;
-  return rd(MPU_ADDR, 0x75, &who, 1);
+  return readRegs(MPU, 0x75, &who, 1);
 }
 
-static bool initMag() {
-  wr(MPU_ADDR, 0x6A, 0x00);
-  wr(MPU_ADDR, 0x37, 0x02); delay(10);    // bypass mode
-  wr(MAG_ADDR, 0x0B, 0x01); delay(10);    // soft reset
+bool initMag() {
+  writeReg(MPU, 0x6A, 0x00);              // internal I2C master off
+  writeReg(MPU, 0x37, 0x02); delay(10);   // bypass: magnetometer on main bus
+  writeReg(MAG, 0x0B, 0x01); delay(10);   // soft reset
   uint8_t wia = 0;
-  if (!rd(MAG_ADDR, 0x00, &wia, 1) || wia != 0x48) return false;
-  wr(MAG_ADDR, 0x0A, 0x00); delay(10);
-  wr(MAG_ADDR, 0x0A, 0x0F); delay(10);    // ROM access
-  uint8_t r[3]; rd(MAG_ADDR, 0x10, r, 3);
-  for (int i = 0; i < 3; i++) asa[i] = (r[i]-128)*0.5f/128.0f + 1.0f;
-  wr(MAG_ADDR, 0x0A, 0x00); delay(10);
-  wr(MAG_ADDR, 0x0A, 0x16); delay(10);    // continuous 100 Hz, 16-bit
+  if (!readRegs(MAG, 0x00, &wia, 1) || wia != 0x48) return false;
+  writeReg(MAG, 0x0A, 0x00); delay(10);
+  writeReg(MAG, 0x0A, 0x0F); delay(10);   // fuse ROM access
+  uint8_t raw[3];
+  readRegs(MAG, 0x10, raw, 3);
+  for (int i = 0; i < 3; i++) asa[i] = (raw[i] - 128) * 0.5f / 128.0f + 1.0f;
+  writeReg(MAG, 0x0A, 0x00); delay(10);
+  writeReg(MAG, 0x0A, 0x16); delay(10);   // continuous 100 Hz, 16-bit
   return true;
 }
 
-static void calibrateGyro() {
-  int32_t s[3] = {0,0,0};
-  int n = 0;
-  unsigned long t0 = millis();
+bool readIMU(float a[3], float g[3]) {
   uint8_t d[14];
-  while (n < CAL_SAMPLES && millis() - t0 < 5000) {
-    if (!rd(MPU_ADDR, 0x3B, d, 14)) { delay(5); continue; }
-    for (int i = 0; i < 3; i++)
-      s[i] += (int16_t)((d[8+i*2]<<8)|d[9+i*2]);
-    n++; delay(5);
-  }
-  if (n) for (int i = 0; i < 3; i++) gBias[i] = (float)s[i]/n;
-}
-
-// Public: call once from setup(). Returns false if MPU not found.
-bool imuBegin() {
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(400000);
-  imuOk = initIMU();
-  mOk = imuOk && initMag();
-  if (!imuOk) return false;
-  calibrateGyro();
-  lastUs = micros();
-  return true;
-}
-
-// ============================================================
-//  Sensor reads
-// ============================================================
-static bool readIMU(float a[3], float g[3]) {
-  uint8_t d[14];
-  if (!rd(MPU_ADDR, 0x3B, d, 14)) return false;
+  if (!readRegs(MPU, 0x3B, d, 14)) return false;
   for (int i = 0; i < 3; i++) {
-    a[i] = (int16_t)((d[i*2]<<8)|d[i*2+1]) / 8192.0f;
-    g[i] = (int16_t)((d[8+i*2]<<8)|d[9+i*2]) / 65.5f - gBias[i];
+    a[i] = (int16_t)((d[i * 2] << 8) | d[i * 2 + 1]) / 4096.0f;   // +/-8 g
+    g[i] = (int16_t)((d[8 + i * 2] << 8) | d[9 + i * 2]) / 65.5f;  // +/-500 dps
   }
   return true;
 }
 
-static void readMag() {
-  if (!mOk) return;
+bool readMagUT(float ut[3]) {
   uint8_t st1 = 0;
-  if (!rd(MAG_ADDR, 0x02, &st1, 1) || !(st1 & 0x01)) return;
+  if (!readRegs(MAG, 0x02, &st1, 1) || !(st1 & 0x01)) return false;
   uint8_t d[7];
-  if (!rd(MAG_ADDR, 0x03, d, 7)) return;
-  if (d[6] & 0x08) return;                 // overflow
-  float ut[3];
+  if (!readRegs(MAG, 0x03, d, 7)) return false;
+  if (d[6] & 0x08) return false;          // overflow
   for (int i = 0; i < 3; i++)
-    ut[i] = (int16_t)((d[i*2+1]<<8)|d[i*2]) * asa[i] * 0.15f;
+    ut[i] = (int16_t)((d[i * 2 + 1] << 8) | d[i * 2]) * asa[i] * 0.15f;
+  return true;
+}
 
-  if (mCal) {
-    for (int i = 0; i < 3; i++) {
-      if (ut[i] < cmn[i]) cmn[i] = ut[i];
-      if (ut[i] > cmx[i]) cmx[i] = ut[i];
+// ---------------- Ring buffer ----------------
+void pushSample(const Sample &s) {
+  portENTER_CRITICAL(&bufMux);
+  if (head - tail >= BUF_SIZE) {          // full: drop the oldest sample
+    tail++;
+    dropped++;
+  }
+  buf[head % BUF_SIZE] = s;
+  head++;
+  portEXIT_CRITICAL(&bufMux);
+}
+
+// ---------------- Network task (core 0) ----------------
+Sample batch[MAX_BATCH];
+char body[MAX_BATCH * 96 + 192];
+
+size_t buildBody(uint32_t n) {
+  size_t len = snprintf(body, sizeof(body),
+    "{\"device\":\"%s\",\"boot\":%lu,\"imu\":%s,\"mag\":%s,\"dropped\":%lu,\"s\":[",
+    DEVICE_ID, (unsigned long)bootId, imuOk ? "true" : "false", magOk ? "true" : "false",
+    (unsigned long)dropped);
+  for (uint32_t i = 0; i < n && len < sizeof(body); i++) {
+    const Sample &s = batch[i];
+    len += snprintf(body + len, sizeof(body) - len, "%s[%lu,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f",
+                    i ? "," : "", (unsigned long)s.us, s.a[0], s.a[1], s.a[2], s.g[0], s.g[1], s.g[2]);
+    if (s.hasMag && len < sizeof(body))
+      len += snprintf(body + len, sizeof(body) - len, ",%.1f,%.1f,%.1f", s.m[0], s.m[1], s.m[2]);
+    if (len < sizeof(body)) len += snprintf(body + len, sizeof(body) - len, "]");
+  }
+  if (len < sizeof(body)) len += snprintf(body + len, sizeof(body) - len, "]}");
+  return len < sizeof(body) ? len : 0;
+}
+
+void netTask(void*) {
+  WiFiClient client;
+  HTTPClient http;
+  http.setReuse(true);
+  unsigned long lastSend = 0, lastReconnect = 0, lastPrint = 0;
+  int code = 0;
+
+  for (;;) {
+    unsigned long now = millis();
+    if (now - lastPrint > 2000) {
+      lastPrint = now;
+      Serial.printf("wifi %s | imu %s mag %s | last http %d | buffered %lu dropped %lu\n",
+                    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "down",
+                    imuOk ? "ok" : "FAIL", magOk ? "ok" : "none", code,
+                    (unsigned long)(head - tail), (unsigned long)dropped);
     }
-    return;
-  }
-  // Align mag axes with IMU axes
-  magV[0] = ut[1]; magV[1] = ut[0]; magV[2] = -ut[2];
-  magFresh = true;
-}
 
-// ============================================================
-//  Fall detection
-// ============================================================
-static void updateFall(const float a[3]) {
-  unsigned long now = millis();
-  float m = norm3(a);
-
-  switch (fState) {
-    case F_IDLE:
-      if (m < FALL_FF_G && (fLastMs == 0 || now - fLastMs > FALL_COOLDOWN_MS)) {
-        fState = F_FREEFALL; fT = now; fMinG = m;
+    if (WiFi.status() != WL_CONNECTED) {
+      if (now - lastReconnect > 3000) {
+        lastReconnect = now;
+        WiFi.reconnect();
       }
-      break;
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+    if (now - lastSend < SEND_MS) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    lastSend = now;
 
-    case F_FREEFALL:
-      if (m < fMinG) fMinG = m;
-      if (m > FALL_IMP_G) {
-        if (now - fT >= FALL_FF_MIN_MS) { fState = F_IMPACT; fT = now; fMaxG = m; }
-        else fState = F_IDLE;
-      } else if (m > FALL_EXIT_G || now - fT > FALL_IMP_WIN_MS) {
-        fState = F_IDLE;
-      }
-      break;
+    // Copy a batch out without removing it, so it is resent if the POST fails.
+    portENTER_CRITICAL(&bufMux);
+    uint32_t start = tail;
+    uint32_t n = head - tail;
+    if (n > MAX_BATCH) n = MAX_BATCH;
+    for (uint32_t i = 0; i < n; i++) batch[i] = buf[(start + i) % BUF_SIZE];
+    portEXIT_CRITICAL(&bufMux);
 
-    case F_IMPACT:
-      if (m > fMaxG) fMaxG = m;
-      if (now - fT >= 200) {
-        fState = F_OBSERVE; fT = now; obsSum = obsSum2 = 0; obsN = 0;
-      }
-      break;
+    size_t len = buildBody(n);
+    if (len == 0) continue;
 
-    case F_OBSERVE:
-      obsSum += m; obsSum2 += m*m; obsN++;
-      if (now - fT >= FALL_OBS_MS) {
-        float mean = obsSum / obsN;
-        float var  = obsSum2 / obsN - mean*mean;
-        float sd   = sqrtf(var > 0 ? var : 0);
-        if (sd < FALL_STILL_G) {           // victim still → confirmed fall
-          fCount++; fLastMs = now; fAlert = true;
-          fSev = (fMaxG > 3.0f) ? 2 : 1;
-        }
-        fState = F_IDLE;
-      }
-      break;
-  }
-}
+    http.begin(client, SERVER_URL);
+    http.setConnectTimeout(800);
+    http.setTimeout(1000);
+    http.addHeader("Content-Type", "application/json");
+    if (API_TOKEN[0]) http.addHeader("X-Safeware-Token", API_TOKEN);
+    code = http.POST((uint8_t*)body, len);
+    http.end();
 
-// ============================================================
-//  PDR
-// ============================================================
-static void updatePDR(float a[3], float g[3], float dt) {
-  unsigned long now = millis();
-
-  // Gravity estimate (low-pass)
-  for (int i = 0; i < 3; i++) grav[i] += 0.02f * (a[i] - grav[i]);
-  float gn = norm3(grav);
-  if (gn < 0.5f) return;
-  float u[3] = { grav[0]/gn, grav[1]/gn, grav[2]/gn };
-
-  // Yaw rate around vertical
-  float yawRate = g[0]*u[0] + g[1]*u[1] + g[2]*u[2];
-  if (fabsf(yawRate) < 0.3f) yawRate = 0;
-  heading = wrap360(heading - yawRate * dt);
-
-  // Magnetometer correction
-  if (mOk && magFresh) {
-    magFresh = false;
-    float mn = norm3(magV);
-    bNow = mn;
-    if (mn > 5) {
-      float d[3] = { -u[0], -u[1], -u[2] };                       // down
-      float E[3] = { d[1]*magV[2] - d[2]*magV[1],                 // east = down × mag
-                     d[2]*magV[0] - d[0]*magV[2],
-                     d[0]*magV[1] - d[1]*magV[0] };
-      float en = norm3(E);
-      if (en > 1e-3f) {
-        for (int i = 0; i < 3; i++) E[i] /= en;
-        float N[3] = { E[1]*d[2] - E[2]*d[1],                     // north = east × down
-                       E[2]*d[0] - E[0]*d[2],
-                       E[0]*d[1] - E[1]*d[0] };
-        float mh  = atan2f(E[refAxis], N[refAxis]) * RAD_TO_DEG;
-        float dip = asinf(constrain((magV[0]*d[0]+magV[1]*d[1]+magV[2]*d[2])/mn, -1.0f, 1.0f)) * RAD_TO_DEG;
-
-        if (!refSet) { magRef = wrap360(mh - heading); bRef = mn; dipRef = dip; refSet = true; }
-        magHdg = wrap360(mh - magRef);
-        bool good = fabsf(mn - bRef) < B_TOL*bRef && fabsf(dip - dipRef) < DIP_TOL;
-        mState = good ? 1 : 2;
-        if (good && fabsf(yawRate) < MAX_TURN_RATE)
-          heading = wrap360(heading + K_MAG * wrap180(magHdg - heading) * dt);
-      }
+    if (code == 200) {
+      portENTER_CRITICAL(&bufMux);
+      if ((int32_t)(start + n - tail) > 0) tail = start + n;   // tail may have moved if the buffer overflowed
+      portEXIT_CRITICAL(&bufMux);
     }
   }
-
-  // Step detection
-  float av = a[0]*u[0] + a[1]*u[1] + a[2]*u[2] - gn;
-  avFilt += 0.3f * (av - avFilt);
-  if (armed && avFilt > STEP_HI && now - lastStepMs > STEP_MIN_MS) {
-    armed = false; lastStepMs = now; steps++;
-    posX += STEP_LEN * sinf(heading * DEG_TO_RAD);
-    posY += STEP_LEN * cosf(heading * DEG_TO_RAD);
-    distance += STEP_LEN;
-  }
-  if (!armed && avFilt < STEP_LO) armed = true;
-  walking = steps > 0 && (now - lastStepMs) < WALK_TIMEOUT_MS;
-
-  // Still-state gyro bias trim
-  float an = norm3(a), gyN = norm3(g);
-  if (fabsf(an - 1.0f) < 0.03f && gyN < 2.0f && !walking) stillMs += dt*1000;
-  else stillMs = 0;
-  if (stillMs > 1000)
-    for (int i = 0; i < 3; i++) gBias[i] += 0.002f * g[i];
 }
 
-// ============================================================
-//  Public update — call every loop()
-// ============================================================
-void imuUpdate() {
-  unsigned long nowUs = micros();
-  if (nowUs - lastUs < 10000) return;      // throttle to 100 Hz
-  float dt = (nowUs - lastUs) / 1e6f;
-  lastUs = nowUs;
-  if (dt > 0.1f) dt = 0.1f;
-
-  float a[3], g[3];
-  if (!readIMU(a, g)) { imuOk = false; return; }
-  imuOk = true;
-
-  // Fall detection runs on raw accel — always, independent of calibration
-  updateFall(a);
-
-  readMag();
-
-  // Mag calibration timeout
-  if (mCal && millis() - mCalStart >= MAGCAL_MS) {
-    mCal = false;
-    float r[3];
-    for (int i = 0; i < 3; i++) r[i] = (cmx[i] - cmn[i]) / 2.0f;
-    if (r[0] > 20 && r[1] > 20 && r[2] > 20) {
-      // Keep as-is for now; add Preferences here if you want persistence
-      refSet = false;
-    }
-  }
-
-  updatePDR(a, g, dt);
-}
-
-// ============================================================
-//  Controls
-// ============================================================
-void pdrReset() {
-  posX = posY = 0; heading = 0; steps = 0; distance = 0;
-  refSet = false;
-}
-
-void magCalStart() {
-  if (!mOk) return;
-  for (int i = 0; i < 3; i++) { cmn[i] = 1e9f; cmx[i] = -1e9f; }
-  mCalStart = millis(); mCal = true;
-}
-bool magCalActive() { return mCal; }
-
-// ============================================================
-//  Getters
-// ============================================================
-float pdrX()              { return posX; }
-float pdrY()              { return posY; }
-float pdrHeading()        { return heading; }
-float pdrDistance()       { return distance; }
-unsigned long pdrSteps()  { return steps; }
-bool  pdrWalking()        { return walking; }
-
-bool  magOk()             { return mOk; }
-int   magState()          { return mState; }
-float magField()          { return bNow; }
-float magHeading()        { return magHdg; }
-
-bool  fallActive()        { return fAlert; }
-int   fallSeverity()      { return fSev; }
-unsigned long fallCount() { return fCount; }
-float fallPeakG()         { return fMaxG; }
-void  fallAck()           { fAlert = false; fSev = 0; }
-
-// ============================================================
-//  Demo sketch
-// ============================================================
+// ---------------- Main ----------------
 void setup() {
   Serial.begin(115200);
-  delay(300);
-  Serial.println("Hold still, calibrating gyro...");
-  if (!imuBegin()) {
-    Serial.println("MPU9250 not found — check wiring.");
-    while (1) delay(1000);
-  }
-  Serial.println("Ready.");
+  delay(500);
+  bootId = (uint32_t)random(1, 2147483647);   // hardware RNG on ESP32
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  imuOk = initIMU();
+  magOk = imuOk && initMag();
+  if (!imuOk) Serial.println("IMU not responding. Check wiring.");
+  else if (!magOk) Serial.println("Magnetometer not found. Heading will be gyro only.");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);                   // lower latency
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);
+
+  Serial.println("Streaming to the Jetson. Hold the sensor still for 2 s after boot (gyro calibration).");
+  lastUs = micros();
 }
 
 void loop() {
-  imuUpdate();
+  unsigned long nowUs = micros();
+  if (nowUs - lastUs < 10000) return;     // 100 Hz
+  lastUs = nowUs;
 
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 500) {
-    lastPrint = millis();
-    Serial.printf("x %6.2f  y %6.2f  hdg %6.1f  steps %lu  dist %6.2f  walk %d | mag %d | fall %d n=%lu peak=%.2f\n",
-      pdrX(), pdrY(), pdrHeading(), pdrSteps(), pdrDistance(), pdrWalking(),
-      magState(),
-      fallActive(), fallCount(), fallPeakG());
+  Sample s;
+  if (!readIMU(s.a, s.g)) {
+    imuOk = false;
+    static unsigned long lastInit = 0;
+    if (millis() - lastInit > 1000) {
+      lastInit = millis();
+      imuOk = initIMU();
+      if (imuOk) magOk = initMag();
+    }
+    return;
   }
+  imuOk = true;
+  s.us = nowUs;
+  s.hasMag = magOk && readMagUT(s.m);
+  pushSample(s);
 }
