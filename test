@@ -1,775 +1,403 @@
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <Preferences.h>
+// ============================================================
+//  MPU9250 PDR + Fall Detection
+//  Single-file version. Drop into main.cpp or a .ino sketch.
+// ============================================================
+#include <Arduino.h>
 #include <Wire.h>
+#include <math.h>
 
-// ================= USER SETTINGS =================
-const char* WIFI_SSID = "";
-const char* WIFI_PASS = "";
-const char* AP_SSID   = "Safeware-PDR";   // fallback hotspot if WiFi fails
-const char* AP_PASS   = "safeware123";    // at least 8 characters
-const int SDA_PIN = 21;
-const int SCL_PIN = 22;
+// ---------------- Hardware ----------------
+#define SDA_PIN   21
+#define SCL_PIN   22
+#define MPU_ADDR  0x68
+#define MAG_ADDR  0x0C
 
-// Default magnetometer calibration. The web page's Calibrate button replaces
-// these and saves them to flash.
-float magOffset[3] = {-100.35, -255.51, -377.74};
-float magScale[3]  = {1.367, 0.992, 0.793};
+// ---------------- PDR tuning ----------------
+static const float STEP_LEN       = 0.70f;
+static const float STEP_HI        = 0.12f;
+static const float STEP_LO        = -0.05f;
+static const unsigned long STEP_MIN_MS     = 280;
+static const unsigned long WALK_TIMEOUT_MS = 1500;
+static const int   CAL_SAMPLES    = 200;
 
-// PDR tuning
-float stepLength = 0.70;                  // meters, adjustable on the page, saved to flash
-int   snapDeg = 0;                        // 0 = off, 45 or 90
-const float STEP_HI = 0.12;               // g, vertical accel peak that counts as a step
-const float STEP_LO = -0.05;              // g, must dip below this before the next step
-const unsigned long STEP_MIN_MS = 280;
-const unsigned long WALK_TIMEOUT_MS = 1500;
+// ---------------- Mag fusion tuning ----------------
+static const float K_MAG          = 0.5f;
+static const float B_TOL          = 0.20f;
+static const float DIP_TOL        = 10.0f;
+static const float MAX_TURN_RATE  = 90.0f;
+static const unsigned long MAGCAL_MS = 30000;
 
-// Magnetometer fusion tuning
-const float K_MAG = 0.5;                  // drift correction speed (per second)
-const float B_TOL = 0.20;                 // ignore mag if field strength changes more than 20%
-const float DIP_TOL = 10.0;               // ignore mag if dip angle changes more than 10 degrees
-const float MAX_TURN_RATE = 90.0;         // skip correction during fast turns (deg/s)
-const unsigned long MAGCAL_MS = 30000;    // magnetometer calibration duration
-// =================================================
+// ---------------- Fall detection tuning ----------------
+static const float FALL_FF_G      = 0.55f;   // g, free-fall threshold
+static const float FALL_EXIT_G    = 0.80f;   // g, cancel free-fall above this
+static const float FALL_IMP_G     = 2.30f;   // g, impact spike
+static const float FALL_STILL_G   = 0.13f;   // g, stddev during observation
+static const unsigned long FALL_FF_MIN_MS   = 120;
+static const unsigned long FALL_IMP_WIN_MS  = 1200;
+static const unsigned long FALL_OBS_MS      = 2500;
+static const unsigned long FALL_COOLDOWN_MS = 8000;
 
-#define MPU 0x68
-#define MAG 0x0C
-WebServer server(80);
-Preferences prefs;
-
-// IMU state
-float gBias[3] = {0, 0, 0};
-float grav[3]  = {0, 0, 1};
-bool  imuOk = false;
-bool  calibrating = true;
-int   calCount = 0;
-float calG[3] = {0, 0, 0}, calA[3] = {0, 0, 0};
-const int CAL_SAMPLES = 200;
-int   refAxis = 0;                        // most horizontal sensor axis, used for mag heading
-
-// Magnetometer state
-float asa[3] = {1, 1, 1};
-bool  magOk = false;
-bool  fuseMag = true;
-float magV[3] = {0, 0, 0};
-bool  magFresh = false;
-bool  refSet = false;
-float magRef = 0, bRef = 0, dipRef = 0;
-int   magState = 0;                       // 0 no data, 1 good, 2 disturbed
-float bNow = 0, magHeadingNow = 0;
-bool  magCal = false;
-unsigned long magCalStart = 0;
-float cmn[3], cmx[3];
-char  magMsg[48] = "";
-
-// PDR state
-float heading = 0;                        // degrees, 0 = facing at reset, clockwise positive
-float posX = 0, posY = 0, distance = 0;
-unsigned long steps = 0;
-float avFilt = 0;
-bool  armed = true;
-unsigned long lastStepMs = 0;
-bool  walking = false;
-float stillMs = 0;
-
-// Path history
-const unsigned long MAXPTS = 1500;
-float pathX[MAXPTS], pathY[MAXPTS];
-unsigned long pathCount = 0;
-unsigned long session = 0;
-
-unsigned long lastUs = 0;
-
-// ---------------- Helpers ----------------
-float wrap360(float a) { a = fmodf(a, 360.0f); if (a < 0) a += 360.0f; return a; }
-float wrap180(float a) { a = wrap360(a); if (a > 180.0f) a -= 360.0f; return a; }
-float norm3(const float v[3]) { return sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
-
-void writeReg(uint8_t a, uint8_t r, uint8_t v) {
-  Wire.beginTransmission(a);
-  Wire.write(r);
-  Wire.write(v);
-  Wire.endTransmission();
+// ============================================================
+//  I2C primitives
+// ============================================================
+static void wr(uint8_t a, uint8_t r, uint8_t v) {
+  Wire.beginTransmission(a); Wire.write(r); Wire.write(v); Wire.endTransmission();
 }
-
-bool readRegs(uint8_t a, uint8_t r, uint8_t *buf, uint8_t n) {
-  Wire.beginTransmission(a);
-  Wire.write(r);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((uint8_t)a, (uint8_t)n) != n) return false;
-  for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+static bool rd(uint8_t a, uint8_t r, uint8_t* b, uint8_t n) {
+  Wire.beginTransmission(a); Wire.write(r);
+  if (Wire.endTransmission(false)) return false;
+  if (Wire.requestFrom(a, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) b[i] = Wire.read();
   return true;
 }
 
-// ---------------- Sensors ----------------
-bool initIMU() {
-  writeReg(MPU, 0x6B, 0x80); delay(100);  // reset
-  writeReg(MPU, 0x6B, 0x01); delay(50);   // wake
-  writeReg(MPU, 0x1A, 0x03);              // gyro low-pass ~41 Hz
-  writeReg(MPU, 0x19, 0x09);              // 100 Hz
-  writeReg(MPU, 0x1B, 0x08);              // gyro +/-500 dps
-  writeReg(MPU, 0x1C, 0x08);              // accel +/-4 g
-  writeReg(MPU, 0x1D, 0x03);              // accel low-pass ~44 Hz
+// ============================================================
+//  Module state
+// ============================================================
+static bool imuOk = false, mOk = false;
+
+// IMU / gravity / gyro bias
+static float gBias[3] = {0,0,0};
+static float grav[3]  = {0,0,1};
+
+// Magnetometer
+static float asa[3]   = {1,1,1};
+static float magV[3]  = {0,0,0};
+static bool  magFresh = false;
+static int   refAxis  = 0;
+static bool  refSet   = false;
+static float magRef = 0, bRef = 0, dipRef = 0;
+static int   mState = 0;
+static float bNow = 0, magHdg = 0;
+
+// Mag calibration
+static bool  mCal = false;
+static unsigned long mCalStart = 0;
+static float cmn[3], cmx[3];
+
+// PDR
+static float heading = 0, posX = 0, posY = 0, distance = 0;
+static unsigned long steps = 0;
+static bool  armed = true, walking = false;
+static float avFilt = 0, stillMs = 0;
+static unsigned long lastStepMs = 0;
+
+// Fall detection
+enum FallState : uint8_t { F_IDLE, F_FREEFALL, F_IMPACT, F_OBSERVE };
+static FallState fState = F_IDLE;
+static unsigned long fT = 0, fLastMs = 0, fCount = 0;
+static bool  fAlert = false;
+static int   fSev = 0;
+static float fMinG = 0, fMaxG = 0;
+static float obsSum = 0, obsSum2 = 0;
+static unsigned long obsN = 0;
+
+static unsigned long lastUs = 0;
+
+// ============================================================
+//  Helpers
+// ============================================================
+static float wrap360(float a){ a = fmodf(a,360.0f); if(a<0)a+=360.0f; return a; }
+static float wrap180(float a){ a = wrap360(a); if(a>180.0f)a-=360.0f; return a; }
+static float norm3(const float v[3]){ return sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); }
+
+// ============================================================
+//  Sensor init
+// ============================================================
+static bool initIMU() {
+  wr(MPU_ADDR, 0x6B, 0x80); delay(100);   // reset
+  wr(MPU_ADDR, 0x6B, 0x01); delay(50);    // wake
+  wr(MPU_ADDR, 0x1A, 0x03);               // gyro LPF ~41 Hz
+  wr(MPU_ADDR, 0x19, 0x09);               // 100 Hz
+  wr(MPU_ADDR, 0x1B, 0x08);               // gyro ±500 dps
+  wr(MPU_ADDR, 0x1C, 0x08);               // accel ±4 g
+  wr(MPU_ADDR, 0x1D, 0x03);               // accel LPF ~44 Hz
   uint8_t who = 0;
-  return readRegs(MPU, 0x75, &who, 1);
+  return rd(MPU_ADDR, 0x75, &who, 1);
 }
 
-bool initMag() {
-  writeReg(MPU, 0x6A, 0x00);              // internal I2C master off
-  writeReg(MPU, 0x37, 0x02); delay(10);   // bypass: magnetometer on main bus
-  writeReg(MAG, 0x0B, 0x01); delay(10);   // soft reset
+static bool initMag() {
+  wr(MPU_ADDR, 0x6A, 0x00);
+  wr(MPU_ADDR, 0x37, 0x02); delay(10);    // bypass mode
+  wr(MAG_ADDR, 0x0B, 0x01); delay(10);    // soft reset
   uint8_t wia = 0;
-  if (!readRegs(MAG, 0x00, &wia, 1) || wia != 0x48) return false;
-  writeReg(MAG, 0x0A, 0x00); delay(10);
-  writeReg(MAG, 0x0A, 0x0F); delay(10);   // fuse ROM access
-  uint8_t raw[3];
-  readRegs(MAG, 0x10, raw, 3);
-  for (int i = 0; i < 3; i++) asa[i] = (raw[i] - 128) * 0.5f / 128.0f + 1.0f;
-  writeReg(MAG, 0x0A, 0x00); delay(10);
-  writeReg(MAG, 0x0A, 0x16); delay(10);   // continuous 100 Hz, 16-bit
+  if (!rd(MAG_ADDR, 0x00, &wia, 1) || wia != 0x48) return false;
+  wr(MAG_ADDR, 0x0A, 0x00); delay(10);
+  wr(MAG_ADDR, 0x0A, 0x0F); delay(10);    // ROM access
+  uint8_t r[3]; rd(MAG_ADDR, 0x10, r, 3);
+  for (int i = 0; i < 3; i++) asa[i] = (r[i]-128)*0.5f/128.0f + 1.0f;
+  wr(MAG_ADDR, 0x0A, 0x00); delay(10);
+  wr(MAG_ADDR, 0x0A, 0x16); delay(10);    // continuous 100 Hz, 16-bit
   return true;
 }
 
-bool readIMU(float a[3], float g[3]) {
+static void calibrateGyro() {
+  int32_t s[3] = {0,0,0};
+  int n = 0;
+  unsigned long t0 = millis();
   uint8_t d[14];
-  if (!readRegs(MPU, 0x3B, d, 14)) return false;
+  while (n < CAL_SAMPLES && millis() - t0 < 5000) {
+    if (!rd(MPU_ADDR, 0x3B, d, 14)) { delay(5); continue; }
+    for (int i = 0; i < 3; i++)
+      s[i] += (int16_t)((d[8+i*2]<<8)|d[9+i*2]);
+    n++; delay(5);
+  }
+  if (n) for (int i = 0; i < 3; i++) gBias[i] = (float)s[i]/n;
+}
+
+// Public: call once from setup(). Returns false if MPU not found.
+bool imuBegin() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  imuOk = initIMU();
+  mOk = imuOk && initMag();
+  if (!imuOk) return false;
+  calibrateGyro();
+  lastUs = micros();
+  return true;
+}
+
+// ============================================================
+//  Sensor reads
+// ============================================================
+static bool readIMU(float a[3], float g[3]) {
+  uint8_t d[14];
+  if (!rd(MPU_ADDR, 0x3B, d, 14)) return false;
   for (int i = 0; i < 3; i++) {
-    a[i] = (int16_t)((d[i * 2] << 8) | d[i * 2 + 1]) / 8192.0f;
-    g[i] = (int16_t)((d[8 + i * 2] << 8) | d[9 + i * 2]) / 65.5f;
+    a[i] = (int16_t)((d[i*2]<<8)|d[i*2+1]) / 8192.0f;
+    g[i] = (int16_t)((d[8+i*2]<<8)|d[9+i*2]) / 65.5f - gBias[i];
   }
   return true;
 }
 
-bool readMagUT(float ut[3]) {
+static void readMag() {
+  if (!mOk) return;
   uint8_t st1 = 0;
-  if (!readRegs(MAG, 0x02, &st1, 1) || !(st1 & 0x01)) return false;
+  if (!rd(MAG_ADDR, 0x02, &st1, 1) || !(st1 & 0x01)) return;
   uint8_t d[7];
-  if (!readRegs(MAG, 0x03, d, 7)) return false;
-  if (d[6] & 0x08) return false;          // overflow
-  for (int i = 0; i < 3; i++)
-    ut[i] = (int16_t)((d[i * 2 + 1] << 8) | d[i * 2]) * asa[i] * 0.15f;
-  return true;
-}
-
-void processMag() {
+  if (!rd(MAG_ADDR, 0x03, d, 7)) return;
+  if (d[6] & 0x08) return;                 // overflow
   float ut[3];
-  if (!readMagUT(ut)) return;
-  if (magCal) {
+  for (int i = 0; i < 3; i++)
+    ut[i] = (int16_t)((d[i*2+1]<<8)|d[i*2]) * asa[i] * 0.15f;
+
+  if (mCal) {
     for (int i = 0; i < 3; i++) {
       if (ut[i] < cmn[i]) cmn[i] = ut[i];
       if (ut[i] > cmx[i]) cmx[i] = ut[i];
     }
     return;
   }
-  float c[3];
-  for (int i = 0; i < 3; i++) c[i] = (ut[i] - magOffset[i]) * magScale[i];
-  // Align magnetometer axes with accel/gyro axes
-  magV[0] = c[1];
-  magV[1] = c[0];
-  magV[2] = -c[2];
+  // Align mag axes with IMU axes
+  magV[0] = ut[1]; magV[1] = ut[0]; magV[2] = -ut[2];
   magFresh = true;
 }
 
-void finishMagCal() {
-  magCal = false;
-  float r[3];
-  for (int i = 0; i < 3; i++) r[i] = (cmx[i] - cmn[i]) / 2.0f;
-  if (r[0] < 20 || r[1] < 20 || r[2] < 20) {
-    snprintf(magMsg, sizeof(magMsg), "Not enough rotation. Kept old calibration.");
-    return;
+// ============================================================
+//  Fall detection
+// ============================================================
+static void updateFall(const float a[3]) {
+  unsigned long now = millis();
+  float m = norm3(a);
+
+  switch (fState) {
+    case F_IDLE:
+      if (m < FALL_FF_G && (fLastMs == 0 || now - fLastMs > FALL_COOLDOWN_MS)) {
+        fState = F_FREEFALL; fT = now; fMinG = m;
+      }
+      break;
+
+    case F_FREEFALL:
+      if (m < fMinG) fMinG = m;
+      if (m > FALL_IMP_G) {
+        if (now - fT >= FALL_FF_MIN_MS) { fState = F_IMPACT; fT = now; fMaxG = m; }
+        else fState = F_IDLE;
+      } else if (m > FALL_EXIT_G || now - fT > FALL_IMP_WIN_MS) {
+        fState = F_IDLE;
+      }
+      break;
+
+    case F_IMPACT:
+      if (m > fMaxG) fMaxG = m;
+      if (now - fT >= 200) {
+        fState = F_OBSERVE; fT = now; obsSum = obsSum2 = 0; obsN = 0;
+      }
+      break;
+
+    case F_OBSERVE:
+      obsSum += m; obsSum2 += m*m; obsN++;
+      if (now - fT >= FALL_OBS_MS) {
+        float mean = obsSum / obsN;
+        float var  = obsSum2 / obsN - mean*mean;
+        float sd   = sqrtf(var > 0 ? var : 0);
+        if (sd < FALL_STILL_G) {           // victim still → confirmed fall
+          fCount++; fLastMs = now; fAlert = true;
+          fSev = (fMaxG > 3.0f) ? 2 : 1;
+        }
+        fState = F_IDLE;
+      }
+      break;
   }
-  float avg = (r[0] + r[1] + r[2]) / 3.0f;
-  for (int i = 0; i < 3; i++) {
-    magOffset[i] = (cmx[i] + cmn[i]) / 2.0f;
-    magScale[i] = avg / r[i];
-  }
-  prefs.putBytes("moff", magOffset, sizeof(magOffset));
-  prefs.putBytes("msc", magScale, sizeof(magScale));
-  refSet = false;
-  snprintf(magMsg, sizeof(magMsg), "Saved. Field strength %.0f uT", avg);
-  Serial.printf("Mag calibration saved. Offset %.1f %.1f %.1f  Scale %.3f %.3f %.3f\n",
-                magOffset[0], magOffset[1], magOffset[2], magScale[0], magScale[1], magScale[2]);
 }
 
-// ---------------- PDR ----------------
-void addPoint(float x, float y) {
-  pathX[pathCount % MAXPTS] = x;
-  pathY[pathCount % MAXPTS] = y;
-  pathCount++;
-}
-
-void resetPDR() {
-  posX = posY = 0;
-  heading = 0;
-  steps = 0;
-  distance = 0;
-  pathCount = 0;
-  addPoint(0, 0);
-  refSet = false;                         // re-anchor magnetometer to the new facing direction
-  session++;
-}
-
-void updatePDR(float a[3], float gyro[3], float dt) {
+// ============================================================
+//  PDR
+// ============================================================
+static void updatePDR(float a[3], float g[3], float dt) {
   unsigned long now = millis();
 
-  for (int i = 0; i < 3; i++) gyro[i] -= gBias[i];
-
-  // Gravity estimate gives "up" in the sensor frame
+  // Gravity estimate (low-pass)
   for (int i = 0; i < 3; i++) grav[i] += 0.02f * (a[i] - grav[i]);
   float gn = norm3(grav);
   if (gn < 0.5f) return;
-  float u[3] = {grav[0] / gn, grav[1] / gn, grav[2] / gn};
+  float u[3] = { grav[0]/gn, grav[1]/gn, grav[2]/gn };
 
-  // Gyro heading
-  float yawRate = gyro[0] * u[0] + gyro[1] * u[1] + gyro[2] * u[2];
+  // Yaw rate around vertical
+  float yawRate = g[0]*u[0] + g[1]*u[1] + g[2]*u[2];
   if (fabsf(yawRate) < 0.3f) yawRate = 0;
   heading = wrap360(heading - yawRate * dt);
 
   // Magnetometer correction
-  if (magOk && magFresh && !magCal) {
+  if (mOk && magFresh) {
     magFresh = false;
     float mn = norm3(magV);
     bNow = mn;
     if (mn > 5) {
-      float d[3] = {-u[0], -u[1], -u[2]};                       // down
-      float E[3] = {d[1] * magV[2] - d[2] * magV[1],             // east = down x mag
-                    d[2] * magV[0] - d[0] * magV[2],
-                    d[0] * magV[1] - d[1] * magV[0]};
+      float d[3] = { -u[0], -u[1], -u[2] };                       // down
+      float E[3] = { d[1]*magV[2] - d[2]*magV[1],                 // east = down × mag
+                     d[2]*magV[0] - d[0]*magV[2],
+                     d[0]*magV[1] - d[1]*magV[0] };
       float en = norm3(E);
       if (en > 1e-3f) {
         for (int i = 0; i < 3; i++) E[i] /= en;
-        float N[3] = {E[1] * d[2] - E[2] * d[1],                 // north = east x down
-                      E[2] * d[0] - E[0] * d[2],
-                      E[0] * d[1] - E[1] * d[0]};
-        float mh = atan2f(E[refAxis], N[refAxis]) * RAD_TO_DEG;
-        float dip = asinf(constrain((magV[0] * d[0] + magV[1] * d[1] + magV[2] * d[2]) / mn, -1.0f, 1.0f)) * RAD_TO_DEG;
+        float N[3] = { E[1]*d[2] - E[2]*d[1],                     // north = east × down
+                       E[2]*d[0] - E[0]*d[2],
+                       E[0]*d[1] - E[1]*d[0] };
+        float mh  = atan2f(E[refAxis], N[refAxis]) * RAD_TO_DEG;
+        float dip = asinf(constrain((magV[0]*d[0]+magV[1]*d[1]+magV[2]*d[2])/mn, -1.0f, 1.0f)) * RAD_TO_DEG;
 
-        if (!refSet) {
-          magRef = wrap360(mh - heading);
-          bRef = mn;
-          dipRef = dip;
-          refSet = true;
-        }
-        magHeadingNow = wrap360(mh - magRef);
-        bool good = fabsf(mn - bRef) < B_TOL * bRef && fabsf(dip - dipRef) < DIP_TOL;
-        magState = good ? 1 : 2;
-        if (good && fuseMag && fabsf(yawRate) < MAX_TURN_RATE) {
-          heading = wrap360(heading + K_MAG * wrap180(magHeadingNow - heading) * dt);
-        }
+        if (!refSet) { magRef = wrap360(mh - heading); bRef = mn; dipRef = dip; refSet = true; }
+        magHdg = wrap360(mh - magRef);
+        bool good = fabsf(mn - bRef) < B_TOL*bRef && fabsf(dip - dipRef) < DIP_TOL;
+        mState = good ? 1 : 2;
+        if (good && fabsf(yawRate) < MAX_TURN_RATE)
+          heading = wrap360(heading + K_MAG * wrap180(magHdg - heading) * dt);
       }
     }
   }
 
   // Step detection
-  float av = a[0] * u[0] + a[1] * u[1] + a[2] * u[2] - gn;
+  float av = a[0]*u[0] + a[1]*u[1] + a[2]*u[2] - gn;
   avFilt += 0.3f * (av - avFilt);
   if (armed && avFilt > STEP_HI && now - lastStepMs > STEP_MIN_MS) {
-    armed = false;
-    lastStepMs = now;
-    steps++;
-    float h = heading;
-    if (snapDeg > 0) h = roundf(h / snapDeg) * snapDeg;
-    posX += stepLength * sinf(h * DEG_TO_RAD);
-    posY += stepLength * cosf(h * DEG_TO_RAD);
-    distance += stepLength;
-    addPoint(posX, posY);
+    armed = false; lastStepMs = now; steps++;
+    posX += STEP_LEN * sinf(heading * DEG_TO_RAD);
+    posY += STEP_LEN * cosf(heading * DEG_TO_RAD);
+    distance += STEP_LEN;
   }
   if (!armed && avFilt < STEP_LO) armed = true;
   walking = steps > 0 && (now - lastStepMs) < WALK_TIMEOUT_MS;
 
-  // Slow gyro bias correction while still
-  float an = norm3(a);
-  float gyroNorm = norm3(gyro);
-  if (fabsf(an - 1.0f) < 0.03f && gyroNorm < 2.0f && !walking) stillMs += dt * 1000;
+  // Still-state gyro bias trim
+  float an = norm3(a), gyN = norm3(g);
+  if (fabsf(an - 1.0f) < 0.03f && gyN < 2.0f && !walking) stillMs += dt*1000;
   else stillMs = 0;
-  if (stillMs > 1000) {
-    for (int i = 0; i < 3; i++) gBias[i] += 0.002f * gyro[i];
-  }
+  if (stillMs > 1000)
+    for (int i = 0; i < 3; i++) gBias[i] += 0.002f * g[i];
 }
 
-// ---------------- Web page ----------------
-const char PAGE[] = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Safeware PDR</title>
-<style>
-:root{--bg:#0b0f14;--panel:#141b23;--line:#25303b;--text:#e6edf3;--mute:#7d8b99;--accent:#22d3ee;--good:#3fb950}
-*{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif}
-.app{display:grid;grid-template-rows:auto 1fr;height:100%}
-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}
-.brand{display:flex;align-items:center;gap:10px}
-.logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#22d3ee);display:flex;align-items:center;justify-content:center;font-weight:800;color:#04121f}
-.title{font-weight:700}
-.sub{font-size:12px;color:var(--mute)}
-.conn{font-size:12px;color:var(--mute);display:flex;align-items:center;gap:6px}
-.dot{width:8px;height:8px;border-radius:50%;background:#d64545}
-.dot.ok{background:var(--good);box-shadow:0 0 8px var(--good)}
-main{display:grid;grid-template-columns:1fr 310px;min-height:0}
-.mapwrap{position:relative;min-height:0}
-canvas{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
-.mapbtns{position:absolute;top:12px;right:12px;display:flex;flex-direction:column;gap:6px}
-.scale{position:absolute;left:12px;bottom:12px;font-size:11px;color:var(--mute)}
-.scale i{display:block;height:5px;border:1px solid var(--mute);border-top:0;margin-bottom:4px}
-aside{border-left:1px solid var(--line);padding:14px;overflow:auto;display:flex;flex-direction:column;gap:12px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
-.label{font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:.08em}
-.val{font-size:22px;font-weight:700;margin-top:4px;display:flex;align-items:center}
-.unit{font-size:12px;color:var(--mute);margin-left:3px;font-weight:500}
-.status{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;background:#222c36;color:var(--mute);margin-top:6px}
-.status.walk{background:#1f6f43;color:#d6ffe6}
-.status.cal{background:#7a4b0b;color:#ffe7c2}
-button,select,input{background:#1b242e;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px}
-button{cursor:pointer}
-button:hover{border-color:var(--accent)}
-button.primary{background:var(--accent);color:#04121f;border-color:var(--accent);font-weight:600}
-button.on{border-color:var(--accent);color:var(--accent)}
-.row{display:flex;gap:8px;align-items:center;margin-top:8px}
-.row input,.row select{flex:1;min-width:0}
-.hint{font-size:11px;color:var(--mute);margin-top:6px}
-.arrow{width:18px;height:18px;margin-left:8px;transition:transform .15s}
-.sp{display:flex;align-items:center;gap:8px;margin-top:6px;font-size:11px;color:var(--mute)}
-.bar{flex:1;height:6px;background:#222c36;border-radius:3px;overflow:hidden}
-.fill{height:100%;width:0;background:var(--accent);transition:width .3s}
-@media (max-width:760px){.app{height:auto}main{grid-template-columns:1fr;grid-template-rows:60vh auto}aside{border-left:0;border-top:1px solid var(--line)}}
-</style>
-</head>
-<body>
-<div class="app">
-  <header>
-    <div class="brand">
-      <div class="logo">S</div>
-      <div><div class="title">Safeware PDR</div><div class="sub">live position from IMU dead reckoning</div></div>
-    </div>
-    <div class="conn"><span id="dot" class="dot"></span><span id="conn">connecting</span></div>
-  </header>
-  <main>
-    <div class="mapwrap">
-      <canvas id="map"></canvas>
-      <div class="mapbtns">
-        <button id="zin">+</button>
-        <button id="zout">-</button>
-        <button id="fit">Fit</button>
-        <button id="follow">Follow</button>
-      </div>
-      <div class="scale"><i id="sbar"></i><span id="slabel">1 m</span></div>
-    </div>
-    <aside>
-      <div class="card">
-        <div class="label">Status</div>
-        <span id="status" class="status">connecting</span>
-      </div>
-      <div class="grid">
-        <div class="card"><div class="label">Steps</div><div class="val" id="steps">0</div></div>
-        <div class="card"><div class="label">Distance</div><div class="val"><span id="dist">0.0</span><span class="unit">m</span></div></div>
-        <div class="card"><div class="label">Heading</div><div class="val"><span id="hdg">0</span><span class="unit">&deg;</span><svg id="harrow" class="arrow" viewBox="0 0 20 20"><path d="M10 2 L16 17 L10 13 L4 17 Z" fill="#22d3ee"/></svg></div></div>
-        <div class="card"><div class="label">Position</div><div class="val" style="font-size:16px"><span id="pos">0.0, 0.0</span><span class="unit">m</span></div></div>
-      </div>
-      <div class="card">
-        <div class="label">Controls</div>
-        <div class="row"><button class="primary" id="reset" style="flex:1">Reset position</button><button id="cal" style="flex:1">Recalibrate gyro</button></div>
-        <div class="hint">Face your walking direction before Reset. Gyro calibration needs the sensor still for 2 seconds.</div>
-      </div>
-      <div class="card">
-        <div class="label">Magnetometer</div>
-        <span id="magstat" class="status">-</span>
-        <div class="grid" style="margin-top:10px">
-          <div><div class="label">Field</div><div class="val" style="font-size:18px"><span id="bval">0</span><span class="unit">&micro;T</span></div></div>
-          <div><div class="label">Mag heading</div><div class="val" style="font-size:18px"><span id="mhval">0</span><span class="unit">&deg;</span></div></div>
-        </div>
-        <div id="calbox" style="display:none;margin-top:10px">
-          <div class="hint">Rotate the sensor through every orientation until all three bars fill.</div>
-          <div class="sp"><span>X</span><div class="bar"><div id="spx" class="fill"></div></div></div>
-          <div class="sp"><span>Y</span><div class="bar"><div id="spy" class="fill"></div></div></div>
-          <div class="sp"><span>Z</span><div class="bar"><div id="spz" class="fill"></div></div></div>
-        </div>
-        <div class="row"><button id="fuse" style="flex:1">Fusion: On</button><button id="magcal" style="flex:1">Calibrate</button></div>
-        <div class="hint" id="mmsg"></div>
-      </div>
-      <div class="card">
-        <div class="label">Step length (m)</div>
-        <div class="row"><input id="len" type="number" min="0.3" max="1.2" step="0.01" value="0.70"><button id="lenset">Apply</button></div>
-        <div class="label" style="margin-top:12px">Heading snap</div>
-        <div class="row"><select id="snap"><option value="0">Off</option><option value="45">45&deg;</option><option value="90">90&deg;</option></select></div>
-        <div class="hint">Snap keeps paths straight in hallways and grid-like rooms.</div>
-      </div>
-    </aside>
-  </main>
-</div>
-<script>
-const $ = id => document.getElementById(id);
-const cv = $('map'), ctx = cv.getContext('2d');
-let trail = [[0,0]], cur = {x:0,y:0,h:0,walk:false}, sess = -1, next = 0, curFuse = true;
-let view = {cx:0, cy:0, scale:40}, follow = true, online = false;
-
-function resize(){
-  const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
-  cv.width = r.width * d; cv.height = r.height * d;
-  ctx.setTransform(d,0,0,d,0,0);
-}
-window.addEventListener('resize', resize); resize();
-
-const W = () => cv.clientWidth, H = () => cv.clientHeight;
-const toS = (x,y) => [W()/2 + (x - view.cx)*view.scale, H()/2 - (y - view.cy)*view.scale];
-
-function gridStep(){
-  for (const o of [0.5,1,2,5,10,20,50]) if (o*view.scale >= 40) return o;
-  return 100;
-}
-
-function draw(){
-  const w = W(), h = H();
-  if (follow){ view.cx += (cur.x - view.cx)*0.15; view.cy += (cur.y - view.cy)*0.15; }
-  ctx.clearRect(0,0,w,h);
-
-  const st = gridStep();
-  const x0 = view.cx - w/2/view.scale, x1 = view.cx + w/2/view.scale;
-  const y0 = view.cy - h/2/view.scale, y1 = view.cy + h/2/view.scale;
-  ctx.lineWidth = 1; ctx.font = '10px system-ui'; ctx.fillStyle = '#51606d';
-  for (let i = Math.floor(x0/st); i*st <= x1; i++){
-    const [sx] = toS(i*st, 0);
-    ctx.strokeStyle = i === 0 ? '#2f4a5e' : (i % 5 === 0 ? '#1f2a35' : '#151d26');
-    ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,h); ctx.stroke();
-    if (i % 5 === 0) ctx.fillText((i*st) + ' m', sx + 3, h - 6);
-  }
-  for (let i = Math.floor(y0/st); i*st <= y1; i++){
-    const [, sy] = toS(0, i*st);
-    ctx.strokeStyle = i === 0 ? '#2f4a5e' : (i % 5 === 0 ? '#1f2a35' : '#151d26');
-    ctx.beginPath(); ctx.moveTo(0,sy); ctx.lineTo(w,sy); ctx.stroke();
-    if (i % 5 === 0 && i !== 0) ctx.fillText((i*st) + ' m', 4, sy - 3);
-  }
-
-  if (trail.length > 1){
-    ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 2.5; ctx.lineJoin = 'round';
-    ctx.beginPath();
-    trail.forEach((p,i) => { const [sx,sy] = toS(p[0],p[1]); i ? ctx.lineTo(sx,sy) : ctx.moveTo(sx,sy); });
-    ctx.stroke();
-    ctx.fillStyle = 'rgba(34,211,238,.5)';
-    for (const p of trail){ const [sx,sy] = toS(p[0],p[1]); ctx.beginPath(); ctx.arc(sx,sy,2,0,7); ctx.fill(); }
-  }
-
-  if (trail.length){
-    const [sx,sy] = toS(trail[0][0], trail[0][1]);
-    ctx.fillStyle = '#1f6f43'; ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(sx,sy,8,0,7); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = '#d6ffe6'; ctx.font = 'bold 9px system-ui'; ctx.textAlign = 'center';
-    ctx.fillText('S', sx, sy + 3); ctx.textAlign = 'left';
-  }
-
-  const [px,py] = toS(cur.x, cur.y), a = cur.h * Math.PI / 180;
-  if (cur.walk){
-    const t = (performance.now() % 1200) / 1200;
-    ctx.strokeStyle = `rgba(63,185,80,${1-t})`; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(px,py,10 + t*18,0,7); ctx.stroke();
-  }
-  ctx.save(); ctx.translate(px,py); ctx.rotate(a);
-  const g = ctx.createRadialGradient(0,0,0,0,0,60);
-  g.addColorStop(0,'rgba(59,130,246,.35)'); g.addColorStop(1,'rgba(59,130,246,0)');
-  ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(0,0);
-  ctx.arc(0,0,60,-Math.PI/2 - 0.45,-Math.PI/2 + 0.45); ctx.closePath(); ctx.fill();
-  ctx.fillStyle = '#3b82f6'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.arc(0,0,9,0,7); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = '#fff'; ctx.beginPath();
-  ctx.moveTo(0,-6); ctx.lineTo(4,3); ctx.lineTo(0,1); ctx.lineTo(-4,3); ctx.closePath(); ctx.fill();
-  ctx.restore();
-
-  $('sbar').style.width = (st * view.scale) + 'px';
-  $('slabel').textContent = st + ' m';
-  requestAnimationFrame(draw);
-}
-
-let drag = null;
-cv.addEventListener('pointerdown', e => {
-  drag = {x:e.clientX, y:e.clientY, cx:view.cx, cy:view.cy};
-  cv.setPointerCapture(e.pointerId); follow = false; updFollow(); cv.style.cursor = 'grabbing';
-});
-cv.addEventListener('pointermove', e => {
-  if (!drag) return;
-  view.cx = drag.cx - (e.clientX - drag.x)/view.scale;
-  view.cy = drag.cy + (e.clientY - drag.y)/view.scale;
-});
-cv.addEventListener('pointerup', () => { drag = null; cv.style.cursor = 'grab'; });
-cv.addEventListener('wheel', e => { e.preventDefault(); zoom(e.deltaY < 0 ? 1.2 : 1/1.2); }, {passive:false});
-function zoom(f){ view.scale = Math.min(300, Math.max(4, view.scale*f)); }
-function updFollow(){ $('follow').className = follow ? 'on' : ''; }
-function fit(){
-  const xs = trail.map(p => p[0]).concat(cur.x), ys = trail.map(p => p[1]).concat(cur.y);
-  const mnx = Math.min(...xs), mxx = Math.max(...xs), mny = Math.min(...ys), mxy = Math.max(...ys);
-  view.cx = (mnx + mxx)/2; view.cy = (mny + mxy)/2;
-  view.scale = Math.min(300, Math.max(4, Math.min(W()/(mxx - mnx + 4), H()/(mxy - mny + 4))));
-  follow = false; updFollow();
-}
-$('zin').onclick = () => zoom(1.3);
-$('zout').onclick = () => zoom(1/1.3);
-$('fit').onclick = fit;
-$('follow').onclick = () => { follow = !follow; updFollow(); };
-
-$('reset').onclick = () => fetch('/reset').then(() => { view.cx = 0; view.cy = 0; follow = true; updFollow(); });
-$('cal').onclick = () => fetch('/calibrate');
-$('lenset').onclick = () => fetch('/set?len=' + $('len').value);
-$('snap').onchange = () => fetch('/set?snap=' + $('snap').value);
-$('fuse').onclick = () => fetch('/set?fuse=' + (curFuse ? 0 : 1));
-$('magcal').onclick = () => fetch('/magcal');
-
-async function poll(){
-  try {
-    const r = await fetch(`/pdr?from=${next}&s=${sess}`, {cache:'no-store'});
-    const j = await r.json();
-    if (j.s !== sess){ sess = j.s; trail = []; }
-    for (const p of j.pts) trail.push(p);
-    if (trail.length > 5000) trail.splice(0, trail.length - 5000);
-    next = j.next;
-    cur = {x:j.x, y:j.y, h:j.h, walk:j.walk};
-
-    $('steps').textContent = j.steps;
-    $('dist').textContent = j.dist.toFixed(1);
-    $('hdg').textContent = Math.round(j.h);
-    $('harrow').style.transform = `rotate(${j.h}deg)`;
-    $('pos').textContent = `${j.x.toFixed(1)}, ${j.y.toFixed(1)}`;
-
-    const s = $('status');
-    if (!j.imu){ s.textContent = 'IMU not responding'; s.className = 'status cal'; }
-    else if (j.cal){ s.textContent = 'Calibrating gyro, hold still'; s.className = 'status cal'; }
-    else if (j.walk){ s.textContent = 'Walking'; s.className = 'status walk'; }
-    else { s.textContent = 'Standing'; s.className = 'status'; }
-
-    curFuse = j.fuse;
-    const ms = $('magstat');
-    if (!j.magok){ ms.textContent = 'Not detected'; ms.className = 'status cal'; }
-    else if (j.mcal >= 0){ ms.textContent = `Calibrating: rotate, ${j.mcal}s left`; ms.className = 'status cal'; }
-    else if (!j.fuse){ ms.textContent = 'Off, gyro only'; ms.className = 'status'; }
-    else if (j.mag === 1){ ms.textContent = 'Fused with gyro'; ms.className = 'status walk'; }
-    else if (j.mag === 2){ ms.textContent = 'Disturbed, gyro only'; ms.className = 'status cal'; }
-    else { ms.textContent = 'Waiting for data'; ms.className = 'status'; }
-    $('bval').textContent = j.b.toFixed(1);
-    $('mhval').textContent = Math.round(j.mh);
-    $('fuse').textContent = 'Fusion: ' + (j.fuse ? 'On' : 'Off');
-    $('fuse').className = j.fuse ? 'on' : '';
-    $('calbox').style.display = j.mcal >= 0 ? 'block' : 'none';
-    ['spx','spy','spz'].forEach((id,i) => { $(id).style.width = Math.min(100, j.msp[i] / 90 * 100) + '%'; });
-    $('mmsg').textContent = j.mmsg;
-
-    if (document.activeElement !== $('len')) $('len').value = j.len.toFixed(2);
-    if (document.activeElement !== $('snap')) $('snap').value = j.snap;
-    online = true;
-  } catch(e){ online = false; }
-  $('dot').className = 'dot' + (online ? ' ok' : '');
-  $('conn').textContent = online ? 'connected' : 'offline';
-  setTimeout(poll, 150);
-}
-
-updFollow(); poll(); requestAnimationFrame(draw);
-</script>
-</body>
-</html>
-)HTML";
-
-// ---------------- HTTP handlers ----------------
-void handleRoot() {
-  server.send(200, "text/html", PAGE);
-}
-
-void handlePDR() {
-  unsigned long from = server.hasArg("from") ? strtoul(server.arg("from").c_str(), nullptr, 10) : 0;
-  long s = server.hasArg("s") ? server.arg("s").toInt() : -1;
-  if (s != (long)session) from = 0;
-  unsigned long oldest = pathCount > MAXPTS ? pathCount - MAXPTS : 0;
-  if (from < oldest) from = oldest;
-  if (from > pathCount) from = pathCount;
-  unsigned long to = pathCount;
-  if (to - from > 300) to = from + 300;
-
-  long left = -1;
-  if (magCal) {
-    unsigned long el = millis() - magCalStart;
-    left = el >= MAGCAL_MS ? 0 : (long)((MAGCAL_MS - el) / 1000);
-  }
-  float sp[3] = {0, 0, 0};
-  if (magCal) for (int i = 0; i < 3; i++) sp[i] = cmx[i] > cmn[i] ? cmx[i] - cmn[i] : 0;
-
-  String j;
-  j.reserve(500 + (to - from) * 24);
-  j += "{\"s\":"; j += session;
-  j += ",\"next\":"; j += to;
-  j += ",\"x\":"; j += String(posX, 2);
-  j += ",\"y\":"; j += String(posY, 2);
-  j += ",\"h\":"; j += String(heading, 1);
-  j += ",\"steps\":"; j += steps;
-  j += ",\"dist\":"; j += String(distance, 2);
-  j += ",\"len\":"; j += String(stepLength, 2);
-  j += ",\"snap\":"; j += snapDeg;
-  j += ",\"walk\":"; j += walking ? "true" : "false";
-  j += ",\"cal\":"; j += calibrating ? "true" : "false";
-  j += ",\"imu\":"; j += imuOk ? "true" : "false";
-  j += ",\"magok\":"; j += magOk ? "true" : "false";
-  j += ",\"mag\":"; j += magState;
-  j += ",\"fuse\":"; j += fuseMag ? "true" : "false";
-  j += ",\"b\":"; j += String(bNow, 1);
-  j += ",\"mh\":"; j += String(magHeadingNow, 1);
-  j += ",\"mcal\":"; j += left;
-  j += ",\"msp\":["; j += String(sp[0], 0); j += ","; j += String(sp[1], 0); j += ","; j += String(sp[2], 0); j += "]";
-  j += ",\"mmsg\":\""; j += magMsg; j += "\"";
-  j += ",\"pts\":[";
-  for (unsigned long i = from; i < to; i++) {
-    if (i > from) j += ",";
-    j += "["; j += String(pathX[i % MAXPTS], 2);
-    j += ",";  j += String(pathY[i % MAXPTS], 2); j += "]";
-  }
-  j += "]}";
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", j);
-}
-
-void handleReset() {
-  resetPDR();
-  server.send(200, "text/plain", "ok");
-}
-
-void handleCalibrate() {
-  calibrating = true;
-  calCount = 0;
-  for (int i = 0; i < 3; i++) { calG[i] = 0; calA[i] = 0; }
-  server.send(200, "text/plain", "ok");
-}
-
-void handleMagCal() {
-  if (!magOk) { server.send(200, "text/plain", "no magnetometer"); return; }
-  for (int i = 0; i < 3; i++) { cmn[i] = 1e9; cmx[i] = -1e9; }
-  magCalStart = millis();
-  magCal = true;
-  snprintf(magMsg, sizeof(magMsg), "Rotate the sensor in every direction");
-  server.send(200, "text/plain", "ok");
-}
-
-void handleSet() {
-  if (server.hasArg("len")) {
-    stepLength = constrain(server.arg("len").toFloat(), 0.3f, 1.2f);
-    prefs.putFloat("len", stepLength);
-  }
-  if (server.hasArg("snap")) {
-    int v = server.arg("snap").toInt();
-    snapDeg = (v == 45 || v == 90) ? v : 0;
-  }
-  if (server.hasArg("fuse")) fuseMag = server.arg("fuse").toInt() != 0;
-  server.send(200, "text/plain", "ok");
-}
-
-// ---------------- WiFi ----------------
-void startWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to WiFi");
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    Serial.printf("WiFi failed. Join hotspot %s (password %s)\n", AP_SSID, AP_PASS);
-  }
-  if (MDNS.begin("safeware")) MDNS.addService("http", "tcp", 80);
-}
-
-String pageURL() {
-  IPAddress ip = (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP() : WiFi.localIP();
-  return "http://" + ip.toString();
-}
-
-// ---------------- Main ----------------
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-
-  prefs.begin("pdr", false);
-  if (prefs.isKey("moff") && prefs.isKey("msc")) {
-    prefs.getBytes("moff", magOffset, sizeof(magOffset));
-    prefs.getBytes("msc", magScale, sizeof(magScale));
-    Serial.println("Loaded magnetometer calibration from flash");
-  }
-  stepLength = prefs.getFloat("len", stepLength);
-
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
-  imuOk = initIMU();
-  magOk = imuOk && initMag();
-  if (!imuOk) Serial.println("IMU not responding. Check wiring.");
-  else if (!magOk) Serial.println("Magnetometer not found. Running gyro only.");
-
-  resetPDR();
-  startWiFi();
-
-  server.on("/", handleRoot);
-  server.on("/pdr", handlePDR);
-  server.on("/reset", handleReset);
-  server.on("/calibrate", handleCalibrate);
-  server.on("/magcal", handleMagCal);
-  server.on("/set", handleSet);
-  server.begin();
-
-  Serial.println("Hold the sensor still: calibrating gyro...");
-  lastUs = micros();
-}
-
-void loop() {
-  server.handleClient();
-
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 2000) {
-    lastPrint = millis();
-    Serial.printf("%s | steps %lu  x %.2f  y %.2f  hdg %.1f  mag %s B %.1f  %s\n",
-                  pageURL().c_str(), steps, posX, posY, heading,
-                  !magOk ? "none" : magCal ? "CAL" : magState == 1 ? "good" : magState == 2 ? "disturbed" : "wait",
-                  bNow, calibrating ? "GYRO CAL" : (walking ? "walking" : "still"));
-  }
-
+// ============================================================
+//  Public update — call every loop()
+// ============================================================
+void imuUpdate() {
   unsigned long nowUs = micros();
-  if (nowUs - lastUs < 10000) return;     // 100 Hz
+  if (nowUs - lastUs < 10000) return;      // throttle to 100 Hz
   float dt = (nowUs - lastUs) / 1e6f;
   lastUs = nowUs;
   if (dt > 0.1f) dt = 0.1f;
 
   float a[3], g[3];
-  if (!readIMU(a, g)) {
-    imuOk = false;
-    static unsigned long lastInit = 0;
-    if (millis() - lastInit > 1000) {
-      lastInit = millis();
-      imuOk = initIMU();
-      if (imuOk) magOk = initMag();
-    }
-    return;
-  }
+  if (!readIMU(a, g)) { imuOk = false; return; }
   imuOk = true;
 
-  if (magOk) processMag();
-  if (magCal && millis() - magCalStart >= MAGCAL_MS) finishMagCal();
+  // Fall detection runs on raw accel — always, independent of calibration
+  updateFall(a);
 
-  if (calibrating) {
-    for (int i = 0; i < 3; i++) { calG[i] += g[i]; calA[i] += a[i]; }
-    if (++calCount >= CAL_SAMPLES) {
-      for (int i = 0; i < 3; i++) {
-        gBias[i] = calG[i] / CAL_SAMPLES;
-        grav[i]  = calA[i] / CAL_SAMPLES;
-        calG[i] = calA[i] = 0;
-      }
-      refAxis = 0;
-      for (int i = 1; i < 3; i++) if (fabsf(grav[i]) < fabsf(grav[refAxis])) refAxis = i;
+  readMag();
+
+  // Mag calibration timeout
+  if (mCal && millis() - mCalStart >= MAGCAL_MS) {
+    mCal = false;
+    float r[3];
+    for (int i = 0; i < 3; i++) r[i] = (cmx[i] - cmn[i]) / 2.0f;
+    if (r[0] > 20 && r[1] > 20 && r[2] > 20) {
+      // Keep as-is for now; add Preferences here if you want persistence
       refSet = false;
-      calCount = 0;
-      calibrating = false;
-      Serial.printf("Gyro bias: %.2f %.2f %.2f dps\n", gBias[0], gBias[1], gBias[2]);
     }
-    return;
   }
 
   updatePDR(a, g, dt);
+}
+
+// ============================================================
+//  Controls
+// ============================================================
+void pdrReset() {
+  posX = posY = 0; heading = 0; steps = 0; distance = 0;
+  refSet = false;
+}
+
+void magCalStart() {
+  if (!mOk) return;
+  for (int i = 0; i < 3; i++) { cmn[i] = 1e9f; cmx[i] = -1e9f; }
+  mCalStart = millis(); mCal = true;
+}
+bool magCalActive() { return mCal; }
+
+// ============================================================
+//  Getters
+// ============================================================
+float pdrX()              { return posX; }
+float pdrY()              { return posY; }
+float pdrHeading()        { return heading; }
+float pdrDistance()       { return distance; }
+unsigned long pdrSteps()  { return steps; }
+bool  pdrWalking()        { return walking; }
+
+bool  magOk()             { return mOk; }
+int   magState()          { return mState; }
+float magField()          { return bNow; }
+float magHeading()        { return magHdg; }
+
+bool  fallActive()        { return fAlert; }
+int   fallSeverity()      { return fSev; }
+unsigned long fallCount() { return fCount; }
+float fallPeakG()         { return fMaxG; }
+void  fallAck()           { fAlert = false; fSev = 0; }
+
+// ============================================================
+//  Demo sketch
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("Hold still, calibrating gyro...");
+  if (!imuBegin()) {
+    Serial.println("MPU9250 not found — check wiring.");
+    while (1) delay(1000);
+  }
+  Serial.println("Ready.");
+}
+
+void loop() {
+  imuUpdate();
+
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 500) {
+    lastPrint = millis();
+    Serial.printf("x %6.2f  y %6.2f  hdg %6.1f  steps %lu  dist %6.2f  walk %d | mag %d | fall %d n=%lu peak=%.2f\n",
+      pdrX(), pdrY(), pdrHeading(), pdrSteps(), pdrDistance(), pdrWalking(),
+      magState(),
+      fallActive(), fallCount(), fallPeakG());
+  }
 }
