@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#121212">
+  <title>Safeware System</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css', v='ksu-gear-icons-v5') }}">
+  <script src="{{ url_for('static', filename='dashboard.js', v='ksu-gear-icons-v5') }}" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <!-- Header uses static/ksu-mark.png; the page background uses static/ksu-logo.png. If it's missing, a "KSU" badge shows instead. -->
+      <img class="logo" src="{{ url_for('static', filename='ksu-mark.png') }}" alt="Kennesaw State University"
+           onerror="this.hidden=true; document.getElementById('logo-fallback').hidden=false;">
+      <div class="logo-fallback" id="logo-fallback" hidden>KSU</div>
+      <div>
+        <h1>Safeware System</h1>
+        <p>Worksite: Kennesaw State University</p>
+      </div>
+    </div>
+    <div class="top-right">
+      <a href="/pdr">Estimated walking path</a>
+      <span id="connection-text">Connecting…</span>
+      <time id="clock">--:--</time>
+    </div>
+  </header>
+
+  <main>
+    <section class="status unverified" id="status" aria-live="polite">
+      <div>
+        <p class="status-label">Worker status</p>
+        <p class="status-word" id="status-word">CHECKING</p>
+      </div>
+      <p class="status-text" id="status-text">Waiting for the camera…</p>
+      <button id="ack-all" type="button">Acknowledge alerts</button>
+    </section>
+
+    <details class="panel alert-drawer" id="alerts-drawer">
+      <summary>Recent alerts <span class="alert-count" id="alerts-count">0</span><span class="drawer-hint">Click to view history</span></summary>
+      <p class="note">Recent events, including acknowledged alerts. Active alerts remain visible in Worker status.</p>
+      <ul class="alerts" id="alerts"><li class="empty">No alerts yet.</li></ul>
+    </details>
+
+    <section class="tiles">
+      <div class="tile" id="tile-hr">
+        <p class="tile-label">Heart rate <small>(demo)</small></p>
+        <div class="tile-row"><p class="tile-value"><span id="hr-value">--</span> <small>BPM</small></p><svg class="icon icon-heart" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.2 4.3 2.6h2c.7-1.4 2.2-2.6 4.3-2.6 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z" fill="currentColor"/></svg></div>
+        <p class="tile-state" id="hr-state">--</p>
+        <details class="advanced" id="hr-advanced">
+          <summary>Advanced details</summary>
+          <div class="advanced-body">
+            <p class="detail-note">Simulated data · no live heart-rate sensor connected.</p>
+            <p class="detail-label">Recent trend (BPM)</p>
+            <svg class="detail-chart" viewBox="0 0 240 64" role="img" aria-label="Recent simulated heart-rate readings">
+              <polyline id="hr-trend" points=""/></svg>
+            <p class="detail-note" id="hr-samples">Waiting for history</p>
+            <dl class="detail-values">
+              <div><dt>Lowest</dt><dd id="hr-min">--</dd></div>
+              <div><dt>Average</dt><dd id="hr-avg">--</dd></div>
+              <div><dt>Highest</dt><dd id="hr-max">--</dd></div>
+              <div><dt>Alert status</dt><dd id="hr-alert-detail">--</dd></div>
+            </dl>
+            <p class="detail-note">BPM means beats per minute.</p>
+            <p class="detail-note">Trend scale adjusts to recent readings; it does not show a medical safe range.</p>
+          </div>
+        </details>
+      </div>
+      <div class="tile" id="tile-temp">
+        <p class="tile-label">Body temperature <small>(demo)</small></p>
+        <div class="tile-row"><p class="tile-value"><span id="temp-value">--</span> <small>°F</small></p>
+          <svg class="icon" viewBox="0 0 48 48" aria-hidden="true" fill="currentColor"><circle cx="17" cy="7" r="5.5"/><path d="M10 15h14a3 3 0 0 1 3 3v12h-4v16h-4V33h-2v13h-4V30H9V18a3 3 0 0 1 1-3z"/><path d="M36 6a4 4 0 0 1 4 4v17.5a7 7 0 1 1-8 0V10a4 4 0 0 1 4-4zm0 3a1 1 0 0 0-1 1v19.4a4 4 0 1 0 2 0V10a1 1 0 0 0-1-1z"/><circle cx="36" cy="33" r="3"/><rect x="35" y="16" width="2" height="15"/></svg></div>
+        <p class="tile-state" id="temp-state">--</p>
+        <details class="advanced" id="temp-advanced">
+          <summary>Advanced details</summary>
+          <div class="advanced-body">
+            <p class="detail-note">Simulated data · no live temperature sensor connected.</p>
+            <p class="detail-label">Recent trend (°F)</p>
+            <svg class="detail-chart" viewBox="0 0 240 64" role="img" aria-label="Recent simulated temperature readings">
+              <polyline id="temp-trend" points=""/></svg>
+            <p class="detail-note" id="temp-samples">Waiting for history</p>
+            <dl class="detail-values">
+              <div><dt>Lowest</dt><dd id="temp-min">--</dd></div>
+              <div><dt>Average</dt><dd id="temp-avg">--</dd></div>
+              <div><dt>Highest</dt><dd id="temp-max">--</dd></div>
+              <div><dt>Alert status</dt><dd id="temp-alert-detail">--</dd></div>
+            </dl>
+            <p class="detail-note">Current temperature: <span id="temp-c-detail">--</span></p>
+            <p class="detail-note">Trend scale adjusts to recent readings; it does not show a medical safe range.</p>
+          </div>
+        </details>
+      </div>
+      <div class="tile" id="tile-ppe">
+        <p class="tile-label">Safety gear</p>
+        <p class="ppe-line" id="helmet-row" data-state="UNKNOWN">
+          <span class="gear-label"><svg class="gear-icon" viewBox="0 0 48 48" aria-hidden="true">
+            <path d="M8 33v-5a16 16 0 0 1 32 0v5M19 13v14M29 13v14M5 33h38v6H5z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+            <path class="gear-slash" d="M5 5l38 38" stroke="currentColor" stroke-width="4"/>
+          </svg>Hard hat</span><b id="helmet">Unknown</b>
+        </p>
+        <p class="ppe-line" id="vest-row" data-state="UNKNOWN">
+          <span class="gear-label"><svg class="gear-icon" viewBox="0 0 48 48" aria-hidden="true">
+            <path d="M14 5l10 9L34 5l6 16v22H8V21z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+            <path d="M24 14v29M14 26h7m6 0h7M14 34h7m6 0h7" stroke="currentColor" stroke-width="3"/>
+            <path class="gear-slash" d="M5 5l38 38" stroke="currentColor" stroke-width="4"/>
+          </svg>Safety vest</span><b id="vest">Unknown</b>
+        </p>
+        <p class="tile-state" id="ppe-state">--</p>
+      </div>
+      <div class="tile" id="tile-fall">
+        <p class="tile-label">Fall detection <small id="motion-source"></small></p>
+        <div class="tile-row"><p class="tile-value" id="fall-value">--</p>
+          <svg class="icon fig-standing" viewBox="0 0 48 48" aria-hidden="true" fill="currentColor"><circle cx="24" cy="6.5" r="5.5"/><path d="M17 14h14a3 3 0 0 1 3 3v13h-4v16h-4.5V32h-3v14H18V30h-4V17a3 3 0 0 1 3-3z"/></svg>
+          <svg class="icon fig-fallen" viewBox="0 0 48 48" aria-hidden="true" fill="currentColor"><circle cx="7" cy="31" r="5"/><path d="M13 27h14l13-4 1.5 3.6L30 31v5H13z"/><rect x="1" y="40" width="46" height="3" rx="1.5"/><path d="M12 19l-3-6 2.6-1.4 3 6zM19 18l.5-7h3l-.5 7zM25 19l3.5-5.5 2.5 1.6-3.5 5.5z"/></svg></div>
+        <p class="tile-state" id="fall-state">--</p>
+        <details class="advanced" id="fall-advanced">
+          <summary>Advanced details</summary>
+          <div class="advanced-body">
+            <dl class="detail-values">
+              <div><dt>Data source</dt><dd id="fall-source-detail">--</dd></div>
+              <div><dt>Total acceleration</dt><dd id="fall-smv-detail">--</dd></div>
+              <div><dt>X acceleration</dt><dd id="fall-x-detail">--</dd></div>
+              <div><dt>Y acceleration</dt><dd id="fall-y-detail">--</dd></div>
+              <div><dt>Z acceleration</dt><dd id="fall-z-detail">--</dd></div>
+              <div><dt>Steps</dt><dd id="fall-steps-detail">--</dd></div>
+              <div><dt>Estimated distance</dt><dd id="fall-distance-detail">--</dd></div>
+            </dl>
+            <p class="detail-note">Acceleration is measured in m/s². At rest, total acceleration is usually near 9.8 due to gravity.</p>
+            <p class="detail-note">Fall logic looks for low acceleration followed by an impact. A triggered alert needs a person to check the worker.</p>
+            <a class="detail-link" href="/pdr">Open movement map & calibration</a>
+          </div>
+        </details>
+      </div>
+      <div class="tile" id="tile-battery">
+        <p class="tile-label">Helmet battery</p>
+        <div class="tile-row"><p class="tile-value" id="battery-value">--</p>
+          <svg class="icon" viewBox="0 0 48 48" aria-hidden="true"><rect x="3" y="14" width="38" height="20" rx="4" fill="none" stroke="currentColor" stroke-width="3"/><rect x="42" y="20" width="4" height="8" rx="1.5" fill="currentColor"/><rect id="battery-fill" x="7" y="18" width="0" height="12" rx="1.5" fill="currentColor"/></svg></div>
+        <p class="tile-state" id="battery-state">--</p>
+        <p class="note">Voltage-based estimate</p>
+      </div>
+    </section>
+
+    <section class="bottom">
+      <div class="panel">
+        <h2>Helmet camera</h2>
+        <div class="camera">
+          <img id="camera-image" alt="Live helmet camera" hidden>
+          <p id="camera-off">Camera offline</p>
+        </div>
+        <p class="note">People recognized: <b id="camera-workers">--</b></p>
+      </div>
+      <div class="panel map-panel">
+        <h2>Estimated walking path</h2>
+        <iframe class="movement-map" src="/pdr?embed=1" title="Wearable movement map relative to starting point" loading="lazy"></iframe>
+        <p class="note">Estimated movement relative to the starting point · not GPS.</p>
+        <a class="detail-link" href="/pdr" target="_blank" rel="noopener">Open full map & calibration</a>
+      </div>
+    </section>
+
+    <section class="demo">
+      <span>Test alerts (simulated):</span>
+      <button data-trigger="fall">Simulate fall</button>
+      <button data-trigger="temp">High temperature</button>
+      <button data-trigger="hr">High heart rate</button>
+    </section>
+  </main>
+</body>
+</html>

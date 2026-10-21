@@ -1,0 +1,115 @@
+/* Smart PPE Safety System — plain dark KSU theme
+   KSU Hooty Hoo Gold #FFC629, Legacy Black #2D2926
+   Page background matches the logo image (#1d1d1d) so the watermark blends in. */
+:root {
+  --gold: #FFC629;
+  --bg: #1d1d1d;
+  --card: rgba(40, 38, 36, .72);
+  --line: #3b3936;
+  --text: #f4f3f1;
+  --muted: #a9aaa8;
+  --ok: #2fbf6b;
+  --warn: #f0862b;
+  --bad: #e5384a;
+  --unknown: #858a8f;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font-family: "Segoe UI", Arial, sans-serif; }
+p { margin: 0; }
+button { font: inherit; cursor: pointer; }
+
+/* Faint KSU logo watermark behind the whole page */
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background: url("ksu-logo.png") center 60% / min(85vh, 85vw) no-repeat;
+  opacity: .16;
+}
+
+/* Header */
+.topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; padding: 12px 24px; background: #121212; border-bottom: 4px solid var(--gold); }
+.brand { display: flex; align-items: center; gap: 14px; }
+.logo { height: 52px; }
+.logo[hidden], .logo-fallback[hidden] { display: none; }
+.logo-fallback { display: grid; place-items: center; width: 52px; height: 52px; border-radius: 6px; background: var(--gold); color: #000; font-weight: 900; }
+h1 { margin: 0; font-size: 22px; }
+.brand p { color: var(--gold); font-size: 13px; }
+.top-right { display: flex; align-items: center; gap: 18px; font-size: 14px; color: var(--muted); }
+.top-right a { color: var(--text); }
+#clock { color: var(--text); font-variant-numeric: tabular-nums; }
+
+main { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+/* Big status bar */
+.status { display: flex; align-items: center; gap: 28px; padding: 22px 26px; border-radius: 10px; color: #fff; background: var(--unknown); }
+.status.safe { background: var(--ok); }
+.status.warning { background: var(--warn); }
+.status.emergency { background: var(--bad); }
+.status-label { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; opacity: .85; }
+.status-word { font-size: 44px; font-weight: 900; line-height: 1.1; }
+.status-text { flex: 1; font-size: 19px; }
+#ack-all { display: none; padding: 12px 18px; border: 0; border-radius: 6px; background: #fff; color: var(--bad); font-weight: 800; }
+.status.emergency #ack-all { display: block; }
+
+/* Tiles */
+.tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-top: 16px; }
+.tile { padding: 16px; border: 1px solid var(--line); border-top: 5px solid var(--unknown); border-radius: 8px; background: var(--card); }
+.tile.ok { border-top-color: var(--ok); }
+.tile.bad { border-top-color: var(--bad); }
+.tile-label { font-size: 14px; font-weight: 700; }
+.tile-label small { color: var(--muted); font-weight: 400; }
+.tile-value { margin: 10px 0 6px; font-size: 36px; font-weight: 800; }
+.tile-value small { font-size: 15px; color: var(--muted); font-weight: 600; }
+.tile-state { font-size: 14px; font-weight: 700; color: var(--unknown); }
+.tile.ok .tile-state { color: var(--ok); }
+.tile.bad .tile-state { color: var(--bad); }
+.ppe-line { display: flex; justify-content: space-between; margin-top: 8px; font-size: 15px; }
+.ppe-line b.yes { color: var(--ok); }
+.ppe-line b.no { color: var(--bad); }
+.ppe-line b.unknown { color: var(--unknown); }
+
+/* Camera + alerts */
+.bottom { display: grid; grid-template-columns: 3fr 2fr; gap: 14px; margin-top: 16px; }
+.panel { padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
+h2 { margin: 0 0 12px; font-size: 16px; }
+.camera { display: grid; place-items: center; height: 280px; border-radius: 6px; background: #0f0f0f; overflow: hidden; }
+.camera img { width: 100%; height: 100%; object-fit: contain; }
+.camera img[hidden], #camera-off[hidden] { display: none; }
+#camera-off { color: var(--muted); }
+.note { margin-top: 10px; color: var(--muted); font-size: 14px; }
+.note b { color: var(--text); }
+.alerts { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+.alerts li { display: flex; justify-content: space-between; gap: 10px; padding: 10px 12px; margin-bottom: 8px; border-left: 4px solid var(--bad); border-radius: 4px; background: rgba(229, 56, 74, .14); font-size: 14px; }
+.alerts li.warning { border-left-color: var(--warn); background: rgba(240, 134, 43, .14); }
+.alerts li.empty { border: 0; background: none; color: var(--muted); }
+.alerts time { color: var(--muted); white-space: nowrap; }
+
+/* Demo buttons */
+.demo { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 16px; color: var(--muted); font-size: 14px; }
+.demo button { padding: 8px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); }
+.demo button:hover { border-color: var(--gold); background: var(--gold); color: #000; }
+
+@media (max-width: 1000px) { .tiles { grid-template-columns: repeat(2, 1fr); } .bottom { grid-template-columns: 1fr; } }
+@media (max-width: 600px) {
+  .tiles { grid-template-columns: 1fr; }
+  .status { flex-direction: column; align-items: flex-start; gap: 10px; }
+  main { padding: 14px; }
+}
+
+/* Allow plain-language labels to wrap on laptop and phone screens. */
+.ppe-line { gap: 8px; flex-wrap: wrap; }
+.tile-state { line-height: 1.45; }
+.status-word { font-size: clamp(26px, 3.2vw, 40px); }
+.status { flex-wrap: wrap; }
+.tile, .panel { min-width: 0; }
+button:focus-visible, a:focus-visible { outline: 3px solid var(--gold); outline-offset: 3px; }
+
+/* Icons from the latest HTML: fixed sizes prevent default SVG expansion. */
+.tile-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.tile-row .tile-value { min-width: 0; overflow-wrap: anywhere; }
+.icon { display: block; width: 42px; height: 42px; flex: 0 0 42px; color: var(--gold); }
+.icon-heart { color: #ed8191; }
+#tile-fall .fig-standing, #tile-fall .fig-fallen { display: none; }
+#tile-fall.ok .fig-standing { display: block; color: var(--ok); }
+#tile-fall.bad .fig-fallen { display: block; color: var(--bad); }
+#tile-battery.bad .icon { color: var(--bad); }
