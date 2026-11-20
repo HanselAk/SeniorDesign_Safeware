@@ -17,14 +17,27 @@ struct Sample {
 void pushSample(const Sample& sample);
 
 // ================= YOUR SETTINGS =================
-const char* WIFI_SSID = "";
-const char* WIFI_PASS = "?";
+// Wi-Fi networks, tried in order. If one can't connect for 15 s, the
+// next one is tried. Each has the Jetson's IP on THAT network.
+struct WifiNetwork {
+  const char* ssid;
+  const char* pass;
+  const char* url;
+};
 
-const char* SERVER_URL =
-    "http://172.20.10.12:5000/api/imu";
+const WifiNetwork NETWORKS[] = {
+    {"Matteo", "Lean165?", "http://172.20.10.12:5000/api/imu"},
+    {"Hansel", "hansel123", "http://172.20.10.9:5000/api/imu"},
+};
+
+const int NETWORK_COUNT = sizeof(NETWORKS) / sizeof(NETWORKS[0]);
+const uint32_t WIFI_SWITCH_MS = 15000;
+
+int netIndex = 0;
+const char* SERVER_URL = NETWORKS[0].url;
 
 const char* API_TOKEN = "";
-const char* DEVICE_ID = "worker-2";
+const char* DEVICE_ID = "worker-3";
 
 const int SDA_PIN = 21;
 const int SCL_PIN = 22;
@@ -176,6 +189,20 @@ int recentCount = 0;
 volatile float hrBpm = 0;
 volatile float hrQuality = 0;
 const char* volatile hrStatus = "starting";
+
+// ================= WI-FI =================
+
+// Starts connecting to NETWORKS[i] and points uploads at its Jetson IP.
+void connectNetwork(int i) {
+  netIndex = i;
+  SERVER_URL = NETWORKS[i].url;
+
+  WiFi.disconnect();
+  WiFi.begin(NETWORKS[i].ssid, NETWORKS[i].pass);
+
+  Serial.printf("Connecting to Wi-Fi: %s\n", NETWORKS[i].ssid);
+  Serial.printf("Jetson endpoint: %s\n", SERVER_URL);
+}
 
 // ================= ALARM OUTPUTS =================
 
@@ -843,9 +870,10 @@ void netTask(void*) {
               : String("down");
 
       Serial.printf(
-          "wifi %s | imu %s mag %s | last http %d | "
+          "wifi %s %s | imu %s mag %s | last http %d | "
           "buffered %lu dropped %lu | "
           "hr %.1f q %.2f led 0x%02X %s\n",
+          NETWORKS[netIndex].ssid,
           address.c_str(),
           imuOk ? "ok" : "FAIL",
           magOk ? "ok" : "none",
@@ -859,15 +887,18 @@ void netTask(void*) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-      if (now - lastReconnect >= 15000) {
+      // No connection for 15 s: move on to the next network in the list.
+      if (now - lastReconnect >= WIFI_SWITCH_MS) {
         lastReconnect = now;
-        WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        connectNetwork((netIndex + 1) % NETWORK_COUNT);
       }
 
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
+
+    // Connected: restart the 15 s countdown for the next dropout.
+    lastReconnect = now;
 
     if (now - lastSend < SEND_MS) {
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -1005,10 +1036,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  Serial.printf("Connecting to Wi-Fi: %s\n", WIFI_SSID);
-  Serial.printf("Jetson endpoint: %s\n", SERVER_URL);
+  connectNetwork(0);
 
   BaseType_t taskCreated = xTaskCreatePinnedToCore(
       netTask,
